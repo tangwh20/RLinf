@@ -897,6 +897,11 @@ class EnvWorker(Worker):
                     env_infos=infos if isinstance(infos, dict) else None,
                     intervene_actions=None,
                     intervene_flags=None,
+                    rlt_switch_flags=(
+                        infos.get("rlt_switch_flags")
+                        if isinstance(infos, dict)
+                        else None
+                    ),
                 )
                 env_outputs.append(env_output)
         else:

@@ -45,12 +45,12 @@ RLT separates representation learning from online RL control.
    .. grid-item-card:: Deployment
       :text-align: center
 
-      Franka real robot / ManiSkill simulation
+      Franka real robot / ManiSkill / LIBERO
 
 | **You'll do:** prepare demonstrations -> train Stage 1 -> point Stage 2 at
   the Stage 1 checkpoint -> launch actor-critic training -> monitor replay-buffer and task
   success metrics.
-| **Prerequisites:** `OpenPI π₀.₅ base weights <https://huggingface.co/lerobot/pi05_base>`__, plus the environment for your example—either :doc:`Franka real-world <../embodied/franka>` or :doc:`ManiSkill simulation <../embodied/maniskill>`.
+| **Prerequisites:** `OpenPI π₀.₅ base weights <https://huggingface.co/lerobot/pi05_base>`__, plus :doc:`Franka real-world <../embodied/franka>`, :doc:`ManiSkill simulation <../embodied/maniskill>`, or :doc:`LIBERO simulation <../embodied/libero>`.
 
 Provided Configuration Files
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -74,6 +74,12 @@ Provided Configuration Files
    * - ManiSkill Stage 2
      - ``examples/embodiment/config/maniskill_rlt_stage2_ac_mlp.yaml``
      - Run simulated RLT actor-critic training with automatic ``rlt_policy_switch`` and transition replay.
+   * - LIBERO Stage 1
+     - ``examples/sft/config/libero_rlt_stage1_sft_openpi_pi05.yaml``
+     - Jointly train the LIBERO OpenPI base policy and RLT token transformer.
+   * - LIBERO Stage 2
+     - ``examples/embodiment/config/libero_spatial_rlt_stage2_ac_mlp.yaml``
+     - Run full-task RLT actor-critic training in LIBERO-Spatial.
 
 Installation
 ------------
@@ -677,6 +683,93 @@ joint-control SFT checkpoint. Keep the expert's OpenPI dataconfig and norm
 stats aligned with the Stage 2 dataset. The expert is only used for train
 rollout; eval rollout runs without expert takeover and measures the learned actor.
 
+Run the LIBERO Spatial Example
+------------------------------
+
+The LIBERO integration uses the standard ``libero_spatial`` environment,
+two RGB views, an 8D end-effector proprioceptive state, and 7D delta actions.
+Each Stage 2 action is a 10-step chunk. Unlike the ManiSkill peg-insertion
+example, LIBERO uses a full-task gate: every transition is eligible for replay,
+while the learner warmup decides whether the reference VLA or Stage 2 actor
+controls the environment.
+
+Stage 1: Jointly Train the LIBERO OpenPI + RLT Feature Model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Edit ``examples/sft/config/libero_rlt_stage1_sft_openpi_pi05.yaml``:
+
+.. code:: yaml
+
+   data:
+     train_data_paths:
+       - dataset_path: /path/to/libero
+         weight: 1.0
+
+   actor:
+     model:
+       model_path: /path/to/model/RLinf-Pi05-LIBERO-SFT
+       openpi_data:
+         repo_id: physical-intelligence/libero
+         norm_stats_path: /path/to/libero/norm_stats.json
+       openpi:
+         config_name: pi05_libero
+         use_rlt: True
+
+Launch Stage 1:
+
+.. code:: bash
+
+   bash examples/sft/run_vla_sft.sh libero_rlt_stage1_sft_openpi_pi05
+
+Keep ``openpi_data.repo_id`` and ``norm_stats_path`` aligned with the
+base LIBERO checkpoint and dataset. Stage 2 must use the same normalization
+statistics.
+
+Stage 2: Run LIBERO RLT Actor-Critic
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Point ``rollout.rlt_feature_model.model_path`` in
+``examples/embodiment/config/libero_spatial_rlt_stage2_ac_mlp.yaml`` to
+the Stage 1 ``actor`` directory:
+
+.. code:: yaml
+
+   env:
+     train:
+       rlt_policy_switch:
+         enable: True
+         actor_start_step: 0
+     eval:
+       rlt_policy_switch:
+         enable: True
+         actor_start_step: 0
+
+   rollout:
+     rlt_feature_model:
+       model_path: /path/to/libero_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor
+       openpi_data:
+         repo_id: physical-intelligence/libero
+         norm_stats_path: /path/to/libero/norm_stats.json
+       openpi:
+         config_name: pi05_libero
+         use_rlt: True
+
+Launch Stage 2:
+
+.. code:: bash
+
+   bash examples/embodiment/run_embodiment.sh libero_spatial_rlt_stage2_ac_mlp
+
+With ``actor_start_step: 0``, LIBERO marks the whole episode as the RLT
+phase. Before
+``algorithm.rlt_schedule.warmup_post_collect_updates``, rollout still
+executes the frozen VLA ``ref_chunk`` and records its transitions. After
+warmup, the Stage 2 actor controls the episode. Set ``actor_start_step`` to
+a positive primitive-environment step when a task should retain reference
+control for an initial prefix. Because routing happens once per action chunk,
+the switch is observed at the next chunk boundary.
+
+
 Replay Buffer Behavior
 ----------------------
 
@@ -697,9 +790,9 @@ This means:
   same replay buffer.
 - Steps after the switch use the actor action and are also stored with the
   same RLT observation format.
-- The ManiSkill route chooses actor actions or the VLA ``ref_chunk`` at whole
+- The simulator route chooses actor actions or the VLA ``ref_chunk`` at whole
   chunk granularity. The replay ``action`` is always the executed action.
-- The ManiSkill learner splits rollout chunks into 1-sample transition
+- The simulator learner splits rollout chunks into 1-sample transition
   trajectories before adding them to RLinf ``TrajectoryReplayBuffer``.
 - ``sample_window_size`` controls the recent transition window sampled from the
   replay buffer. It does not need to match ``max_steps_per_rollout_epoch``.
@@ -728,15 +821,15 @@ Useful RLT signals:
   - ``env/success_once`` and ``env/episode_len``: task outcome metrics.
   - ``eval/success_once``: success rate on fixed eval reset ids.
 
-  ManiSkill rollout / replay diagnostics (logged from trajectories received by the actor):
+  Simulator rollout / replay diagnostics (logged from trajectories received by the actor):
 
   - ``train/replay/record_transition_rate``: fraction of collected steps saved as RLT transitions (from ``forward_inputs.record_transition``).
   - ``train/replay/actor_switch_rate``: fraction of collected steps where the actor/student action actually controlled the env (from ``forward_inputs.actor_switch``).
   - ``train/replay/intervention_requested_rate``: fraction of steps where the env requested expert takeover (from ``forward_inputs.intervention_requested``).
   - ``train/replay/intervention_rate``: fraction of steps where the route actually applied expert actions (from ``trajectory.intervene_flags``).
-  - ``train/replay/transition_count``, ``train/replay/reward_mean``, ``train/replay/reward_positive_rate``, ``train/replay/done_rate``: ManiSkill transition-replay ingest stats for the current collect step.
+  - ``train/replay/transition_count``, ``train/replay/reward_mean``, ``train/replay/reward_positive_rate``, ``train/replay/done_rate``: simulator transition-replay ingest stats for the current collect step.
 
-  RLT schedule / learner backlog (ManiSkill ``algorithm.rlt_schedule.enable``):
+  RLT schedule / learner backlog (simulator ``algorithm.rlt_schedule.enable``):
 
   - ``train/rlt/ready_for_online``: whether learner ``update_step`` has passed ``warmup_post_collect_updates``.
   - ``train/rlt/actor_updates_run``, ``train/rlt/critic_updates_run``, and ``train/rlt/pending_update_budget``: actor/critic updates executed in the step and remaining learner backlog.

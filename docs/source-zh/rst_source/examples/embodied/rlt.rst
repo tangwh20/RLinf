@@ -39,10 +39,11 @@ RLT 将表示学习和在线 RL 控制拆开。
    .. grid-item-card:: 部署
       :text-align: center
 
-      Franka 真机 / ManiSkill 仿真
+      Franka 真机 / ManiSkill / LIBERO 仿真
 
 | **你将完成：** 准备示范数据 -> 训练 Stage 1 -> 在 Stage 2 中加载 Stage 1 检查点 -> 启动 actor-critic 训练 -> 观察 replay buffer 与任务成功率指标。
-| **前置条件：** 准备好 `OpenPI π₀.₅ <https://huggingface.co/lerobot/pi05_base>`__ 基座模型，并按所选示例配置 :doc:`Franka 真机环境 <../embodied/franka>` 或 :doc:`ManiSkill 仿真环境 <../embodied/maniskill>` （二选一）。
+| **前置条件：** 准备好 `OpenPI π₀.₅ <https://huggingface.co/lerobot/pi05_base>`__ 基座模型，并按所选示例配置 :doc:`Franka 真机环境 <../embodied/franka>`、:doc:`ManiSkill 仿真环境 <../embodied/maniskill>` 或 :doc:`LIBERO 仿真环境 <../embodied/libero>`。
+
 
 提供的配置文件
 ~~~~~~~~~~~~~~
@@ -66,6 +67,12 @@ RLT 将表示学习和在线 RL 控制拆开。
    * - ManiSkill Stage 2
      - ``examples/embodiment/config/maniskill_rlt_stage2_ac_mlp.yaml``
      - 使用自动 ``rlt_policy_switch`` 和 transition replay 训练仿真 RLT actor-critic。
+   * - LIBERO Stage 1
+     - ``examples/sft/config/libero_rlt_stage1_sft_openpi_pi05.yaml``
+     - 联合训练 LIBERO OpenPI 基座和 RLT token transformer。
+   * - LIBERO Stage 2
+     - ``examples/embodiment/config/libero_spatial_rlt_stage2_ac_mlp.yaml``
+     - 在 LIBERO-Spatial 中运行 full-task RLT actor-critic。
 
 安装
 ----
@@ -642,6 +649,89 @@ ManiSkill expert takeover 默认关闭。需要在 critical phase 中用更强�
 joint-control SFT checkpoint。expert 的 OpenPI dataconfig 和 norm stats 需要和
 Stage 2 数据保持一致。expert 只用于 train rollout；eval rollout 不会执行 expert takeover，评测的是学到的 actor。
 
+运行 LIBERO Spatial 示例
+-------------------------
+
+LIBERO 接入使用标准 ``libero_spatial`` 环境、两个 RGB 视角、8 维末端执行器
+proprio 状态和 7 维 delta action。每个 Stage 2 action 是 10-step chunk。
+与 ManiSkill peg insertion 示例不同，LIBERO 使用 full-task gate：整段 episode
+中的 transition 都可以进入 replay，而 learner warmup 决定实际由 reference VLA
+还是 Stage 2 actor 控制环境。
+
+Stage 1：联合训练 LIBERO OpenPI + RLT 特征模型
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+修改 ``examples/sft/config/libero_rlt_stage1_sft_openpi_pi05.yaml``：
+
+.. code:: yaml
+
+   data:
+     train_data_paths:
+       - dataset_path: /path/to/libero
+         weight: 1.0
+
+   actor:
+     model:
+       model_path: /path/to/model/RLinf-Pi05-LIBERO-SFT
+       openpi_data:
+         repo_id: physical-intelligence/libero
+         norm_stats_path: /path/to/libero/norm_stats.json
+       openpi:
+         config_name: pi05_libero
+         use_rlt: True
+
+启动 Stage 1：
+
+.. code:: bash
+
+   bash examples/sft/run_vla_sft.sh libero_rlt_stage1_sft_openpi_pi05
+
+``openpi_data.repo_id`` 和 ``norm_stats_path`` 必须与 LIBERO 基座检查点及
+数据集保持一致，Stage 2 也必须使用相同的归一化统计。
+
+Stage 2：运行 LIBERO RLT Actor-Critic
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+将 ``examples/embodiment/config/libero_spatial_rlt_stage2_ac_mlp.yaml``
+中的 ``rollout.rlt_feature_model.model_path`` 指向 Stage 1 的 ``actor``
+目录：
+
+.. code:: yaml
+
+   env:
+     train:
+       rlt_policy_switch:
+         enable: True
+         actor_start_step: 0
+     eval:
+       rlt_policy_switch:
+         enable: True
+         actor_start_step: 0
+
+   rollout:
+     rlt_feature_model:
+       model_path: /path/to/libero_rlt_stage1_sft_openpi_pi05/checkpoints/global_step_<step>/actor
+       openpi_data:
+         repo_id: physical-intelligence/libero
+         norm_stats_path: /path/to/libero/norm_stats.json
+       openpi:
+         config_name: pi05_libero
+         use_rlt: True
+
+启动 Stage 2：
+
+.. code:: bash
+
+   bash examples/embodiment/run_embodiment.sh libero_spatial_rlt_stage2_ac_mlp
+
+当 ``actor_start_step: 0`` 时，LIBERO 会把整段 episode 标记为 RLT 阶段。
+在达到 ``algorithm.rlt_schedule.warmup_post_collect_updates`` 之前，
+rollout 仍执行冻结 VLA 的 ``ref_chunk`` 并记录 transition；warmup 完成后，
+Stage 2 actor 接管整段 episode。如果任务需要先保留一段 reference 控制，可以把
+``actor_start_step`` 设为正的 primitive environment step。由于路由在每个
+action chunk 开始时执行，切换会在下一个 chunk 边界生效。
+
+
 Replay Buffer 逻辑
 ------------------
 
@@ -658,8 +748,8 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
 
 - 真机切换前的 step 仍然会用于训练。这些 step 的执行动作是 VLA reference action，transition 也会进入同一个 replay buffer。
 - 切换后的 step 执行 actor action，并以相同的 RLT observation 格式存储。
-- ManiSkill route 在整 chunk 级别选择 actor action 或 VLA ``ref_chunk``，replay 中的 ``action`` 始终是实际执行的动作。
-- ManiSkill learner 会把 rollout chunk 切成 1-sample transition trajectory，再放进 RLinf ``TrajectoryReplayBuffer``。
+- 仿真 route 在整 chunk 级别选择 actor action 或 VLA ``ref_chunk``，replay 中的 ``action`` 始终是实际执行的动作。
+- 仿真 learner 会把 rollout chunk 切成 1-sample transition trajectory，再放进 RLinf ``TrajectoryReplayBuffer``。
 - ``sample_window_size`` 控制从 replay buffer 近期窗口中采样的范围，不需要和 ``max_steps_per_rollout_epoch`` 一致。
 - ``max_steps_per_rollout_epoch`` 控制一次 rollout flush 到训练侧之前收集多少环境 step。
 
@@ -684,15 +774,15 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
   - ``env/success_once`` 和 ``env/episode_len``：任务结果指标。
   - ``eval/success_once``：固定 eval reset ids 上的成功率。
 
-  ManiSkill rollout / replay 诊断（由 actor 收到 trajectory 后统计）：
+  仿真 rollout / replay 诊断（由 actor 收到 trajectory 后统计）：
 
   - ``train/replay/record_transition_rate``：收集到的 step 中被保存为 RLT transition 的比例（来自 ``forward_inputs.record_transition``）。
   - ``train/replay/actor_switch_rate``：收集到的 step 中实际由 actor/student action 控制环境的比例（来自 ``forward_inputs.actor_switch``）。
   - ``train/replay/intervention_requested_rate``：env 请求 expert 接管的比例（来自 ``forward_inputs.intervention_requested``）。
   - ``train/replay/intervention_rate``：route 实际应用 expert action 的比例（来自 ``trajectory.intervene_flags``）。
-  - ``train/replay/transition_count``、``train/replay/reward_mean``、``train/replay/reward_positive_rate``、``train/replay/done_rate``：当前 collect step 的 ManiSkill transition-replay 入库统计。
+  - ``train/replay/transition_count``、``train/replay/reward_mean``、``train/replay/reward_positive_rate``、``train/replay/done_rate``：当前 collect step 的仿真 transition-replay 入库统计。
 
-  RLT schedule / learner backlog（ManiSkill ``algorithm.rlt_schedule.enable``）：
+  RLT schedule / learner backlog（仿真 ``algorithm.rlt_schedule.enable``）：
 
   - ``train/rlt/ready_for_online``：learner ``update_step`` 是否已超过 ``warmup_post_collect_updates``。
   - ``train/rlt/actor_updates_run``、``train/rlt/critic_updates_run`` 和 ``train/rlt/pending_update_budget``：本 step 执行的 actor/critic 更新次数，以及剩余 learner backlog。

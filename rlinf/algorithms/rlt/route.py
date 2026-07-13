@@ -145,7 +145,7 @@ class RealworldRLTRoute(RLTRoute):
 
 
 class SimulatorRLTRoute(RLTRoute):
-    """Actor/ref/expert routing for ManiSkill RLT with schedule warmup."""
+    """Actor/ref/expert routing for simulator RLT with schedule warmup."""
 
     def __init__(self, *, use_schedule: bool, warmup_updates: int):
         self.use_schedule = use_schedule
@@ -209,7 +209,7 @@ class SimulatorRLTRoute(RLTRoute):
         if expert_takeover.any():
             if ctx.expert_model is None:
                 raise RuntimeError(
-                    "ManiSkill RLT expert takeover was requested, but expert_model "
+                    "Simulator RLT expert takeover was requested, but expert_model "
                     "is not configured."
                 )
             expert_actions = predict_expert_actions(

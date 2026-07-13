@@ -27,12 +27,15 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
     if train_env_cfg is None:
         return False
     try:
-        return (
-            SupportedEnvType(train_env_cfg.get("env_type", ""))
-            == SupportedEnvType.MANISKILL_RLT
-        )
+        env_type = SupportedEnvType(train_env_cfg.get("env_type", ""))
     except ValueError:
         return False
+    if env_type == SupportedEnvType.MANISKILL_RLT:
+        return True
+    algorithm_cfg = cfg.get("algorithm", {}) or {}
+    return env_type == SupportedEnvType.LIBERO and (
+        algorithm_cfg.get("loss_type", "") == "rlt_ac"
+    )
 
 
 def extract_rlt_obs_from_forward_inputs(

@@ -26,6 +26,7 @@ from rlinf.scheduler import Channel
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
+from rlinf.utils.memory_diagnostics import MemoryDiagnosticsSampler
 from rlinf.utils.metric_logger import MetricLogger
 from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
 from rlinf.utils.runner_utils import check_progress
@@ -191,19 +192,33 @@ class EmbodiedRunner:
         rollout_handle.wait()
 
     def evaluate(self):
-        env_handle: Handle = self.env.evaluate(
-            input_channel=self.env_channel,
-            rollout_channel=self.rollout_channel,
-        )
-        rollout_handle: Handle = self.rollout.evaluate(
-            input_channel=self.rollout_channel,
-            output_channel=self.env_channel,
-        )
-        env_results = env_handle.wait()
-        rollout_handle.wait()
-        eval_metrics_list = [results for results in env_results if results is not None]
-        eval_metrics = compute_evaluate_metrics(eval_metrics_list)
-        return eval_metrics
+        diagnostics_cfg = self.cfg.runner.get("memory_diagnostics", {})
+        sampler = None
+        if diagnostics_cfg.get("enabled", False):
+            sampler = MemoryDiagnosticsSampler(
+                self.logger,
+                float(diagnostics_cfg.get("interval_seconds", 5)),
+            )
+            sampler.start(f"eval_step_{self.global_step}")
+
+        try:
+            env_handle: Handle = self.env.evaluate(
+                input_channel=self.env_channel,
+                rollout_channel=self.rollout_channel,
+            )
+            rollout_handle: Handle = self.rollout.evaluate(
+                input_channel=self.rollout_channel,
+                output_channel=self.env_channel,
+            )
+            env_results = env_handle.wait()
+            rollout_handle.wait()
+            eval_metrics_list = [
+                results for results in env_results if results is not None
+            ]
+            return compute_evaluate_metrics(eval_metrics_list)
+        finally:
+            if sampler is not None:
+                sampler.stop(f"eval_step_{self.global_step}")
 
     def _log_ranked_metrics(
         self,

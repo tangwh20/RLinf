@@ -24,6 +24,10 @@ import numpy as np
 import torch
 from omegaconf.omegaconf import OmegaConf
 
+from rlinf.envs.libero.rlt import (
+    get_padded_eval_reset_state_ids,
+    get_rlt_switch_flags,
+)
 from rlinf.envs.libero.utils import (
     build_interleaved_eval_reset_state_ids,
     distribute_reset_state_ids_round_robin,
@@ -133,6 +137,7 @@ class LiberoEnv(gym.Env):
 
         self.video_cfg = cfg.video_cfg
         self.current_raw_obs = None
+        self._rlt_switch_cfg = cfg.get("rlt_policy_switch", None)
 
     def _log_evaluation_mode(self):
         """Log the LIBERO evaluation mode banner (rank 0 env worker only)."""
@@ -493,6 +498,11 @@ class LiberoEnv(gym.Env):
 
         if self.is_eval:
             pool = self._eval_reset_pool
+            if bool(self.cfg.get("pad_eval_reset_state_ids", False)):
+                reset_state_ids, self.start_idx = get_padded_eval_reset_state_ids(
+                    pool, self.start_idx, num_reset_states
+                )
+                return reset_state_ids
             if self.start_idx >= len(pool):
                 return np.full((num_reset_states,), -1, dtype=np.int64)
             end = min(self.start_idx + num_reset_states, len(pool))
@@ -561,6 +571,16 @@ class LiberoEnv(gym.Env):
         self.success_episode_len = np.zeros(self.num_envs, dtype=np.int32)
         self._task_success_stats: dict[int, dict[str, int]] = {}
         self._eval_seen_trials: set[tuple[int, int]] = set()
+
+    def _attach_rlt_switch_info(self, infos: dict) -> None:
+        """Attach the full-task LIBERO RLT actor gate to environment info."""
+        switch_flags = get_rlt_switch_flags(
+            self.elapsed_steps,
+            self._rlt_switch_cfg,
+        )
+        if switch_flags is None:
+            return
+        infos["rlt_switch_flags"] = switch_flags
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -713,6 +733,7 @@ class LiberoEnv(gym.Env):
         obs = self._wrap_obs(self.current_raw_obs)
         self._reset_metrics(env_idx)
         infos = {}
+        self._attach_rlt_switch_info(infos)
         return obs, infos
 
     def step(self, actions=None, auto_reset=True):
@@ -730,6 +751,7 @@ class LiberoEnv(gym.Env):
         step_reward = self._calc_step_reward(terminations)
 
         infos = self._record_metrics(step_reward, terminations, infos)
+        self._attach_rlt_switch_info(infos)
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
