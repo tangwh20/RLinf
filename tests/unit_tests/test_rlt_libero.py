@@ -50,8 +50,16 @@ def test_libero_rlt_uses_simulator_transition_route():
     assert route.warmup_updates == 100
 
 
+def test_libero_safety_rlt_uses_simulator_transition_route():
+    cfg = _cfg("libero_safety", "rlt_ac")
+
+    assert use_simulator_transition_replay(cfg)
+    assert isinstance(build_rlt_route(cfg), SimulatorRLTRoute)
+
+
 def test_non_rlt_libero_does_not_change_replay_mode():
     assert not use_simulator_transition_replay(_cfg("libero", "actor_critic"))
+    assert not use_simulator_transition_replay(_cfg("libero_safety", "actor_critic"))
 
 
 def test_libero_without_algorithm_config_does_not_change_replay_mode():

@@ -31,6 +31,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
     """
 
     extra_delta_transform: bool = False
+    image_key: str = "image"
+    wrist_image_key: str = "wrist_image"
+    state_key: str = "state"
 
     @override
     def create(
@@ -48,9 +51,9 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             inputs=[
                 _transforms.RepackTransform(
                     {
-                        "observation/image": "image",
-                        "observation/wrist_image": "wrist_image",
-                        "observation/state": "state",
+                        "observation/image": self.image_key,
+                        "observation/wrist_image": self.wrist_image_key,
+                        "observation/state": self.state_key,
                         "actions": "actions",
                         "prompt": "prompt",
                     }

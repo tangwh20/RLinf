@@ -33,8 +33,13 @@ def use_simulator_transition_replay(cfg: Any) -> bool:
     if env_type == SupportedEnvType.MANISKILL_RLT:
         return True
     algorithm_cfg = cfg.get("algorithm", {}) or {}
-    return env_type == SupportedEnvType.LIBERO and (
-        algorithm_cfg.get("loss_type", "") == "rlt_ac"
+    return (
+        env_type
+        in (
+            SupportedEnvType.LIBERO,
+            SupportedEnvType.LIBERO_SAFETY,
+        )
+        and algorithm_cfg.get("loss_type", "") == "rlt_ac"
     )
 
 

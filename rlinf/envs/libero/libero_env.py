@@ -160,14 +160,24 @@ class LiberoEnv(gym.Env):
         env_fns = []
 
         current_type_val = get_libero_type()
+        safety_repo_path = os.environ.get("LIBERO_SAFETY_REPO_PATH")
 
         for env_fn_param in env_fn_params:
 
-            def env_fn(param=env_fn_param, _type_val=current_type_val):
+            def env_fn(
+                param=env_fn_param,
+                _type_val=current_type_val,
+                _safety_repo_path=safety_repo_path,
+            ):
                 os.environ["LIBERO_TYPE"] = _type_val
                 seed = param.pop("seed")
 
-                if _type_val in ["pro", "plus"]:
+                if _type_val == "safety":
+                    from rlinf.envs import _configure_libero_safety
+
+                    _configure_libero_safety({"repo_path": _safety_repo_path})
+                    from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
+                elif _type_val in ["pro", "plus"]:
                     sys.path[:] = [p for p in sys.path if "opt/libero" not in p]
 
                     pkg_name = f"libero{_type_val}"
@@ -209,6 +219,13 @@ class LiberoEnv(gym.Env):
 
             env_fns.append(env_fn)
         return env_fns
+
+    @staticmethod
+    def _get_bddl_file_path(task, bddl_root):
+        path_parts = [bddl_root, task.problem_folder]
+        if hasattr(task, "level"):
+            path_parts.append(f"L{task.level}")
+        return os.path.join(*path_parts, task.bddl_file)
 
     def get_env_fn_params(self, env_idx=None):
         env_fn_params = []
@@ -261,7 +278,7 @@ class LiberoEnv(gym.Env):
             task = self.task_suite.get_task(self.task_ids[env_id])
             folder_name = task.problem_folder
             file_name = task.bddl_file
-            original_path = os.path.join(bddl_root, folder_name, file_name)
+            original_path = self._get_bddl_file_path(task, bddl_root)
 
             final_path = original_path
 
@@ -397,11 +414,31 @@ class LiberoEnv(gym.Env):
         self.task_descriptions = task_descriptions
         return env_fn_params
 
+    def _get_task_init_states(self, task_id):
+        task = self.task_suite.get_task(task_id)
+        if not hasattr(task, "level"):
+            return self.task_suite.get_task_init_states(task_id)
+
+        from libero.libero import get_libero_path
+
+        init_states_path = os.path.join(
+            get_libero_path("init_states"),
+            task.problem_folder,
+            f"L{task.level}",
+            task.init_states_file,
+        )
+        if not os.path.isfile(init_states_path):
+            raise FileNotFoundError(
+                f"Missing LIBERO-Safety init states for task {task.name!r}: "
+                f"{init_states_path}"
+            )
+        return torch.load(init_states_path, weights_only=False)
+
     def _compute_total_num_group_envs(self):
         self.total_num_group_envs = 0
         self.trial_id_bins = []
         for task_id in range(self.task_suite.get_num_tasks()):
-            task_num_trials = len(self.task_suite.get_task_init_states(task_id))
+            task_num_trials = len(self._get_task_init_states(task_id))
             self.trial_id_bins.append(task_num_trials)
             self.total_num_group_envs += task_num_trials
         self.cumsum_trial_id_bins = np.cumsum(self.trial_id_bins)
@@ -541,9 +578,7 @@ class LiberoEnv(gym.Env):
         if env_idx is None:
             env_idx = np.arange(self.num_envs)
         init_state = [
-            self.task_suite.get_task_init_states(self.task_ids[env_id])[
-                self.trial_ids[env_id]
-            ]
+            self._get_task_init_states(self.task_ids[env_id])[self.trial_ids[env_id]]
             for env_id in env_idx
         ]
         return init_state
@@ -736,6 +771,10 @@ class LiberoEnv(gym.Env):
         self._attach_rlt_switch_info(infos)
         return obs, infos
 
+    def _process_step_infos(self, infos):
+        """Normalize environment-specific step infos before reward calculation."""
+        return infos
+
     def step(self, actions=None, auto_reset=True):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
@@ -745,6 +784,7 @@ class LiberoEnv(gym.Env):
         raw_obs, _reward, terminations, info_lists = self.env.step(actions)
         self.current_raw_obs = raw_obs
         infos = list_of_dict_to_dict_of_list(info_lists)
+        infos = self._process_step_infos(infos)
         truncations = self.elapsed_steps >= self.cfg.max_episode_steps
         obs = self._wrap_obs(raw_obs)
 

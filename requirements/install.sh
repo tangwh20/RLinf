@@ -81,7 +81,7 @@ NO_ROOT=0
 NO_INSTALL_RLINF_CMD="--no-install-project"
 SUPPORTED_TARGETS=("embodied" "agentic" "docs")
 SUPPORTED_MODELS=("openvla" "openvla-oft" "openpi" "gr00t" "gr00t_n1d6" "gr00t_n1d7" "dexbotic" "starvla" "lingbotvla" "dreamzero" "qwen3_vl" "abot_m0")
-SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
+SUPPORTED_ENVS=("behavior" "maniskill_libero" "libero" "libero_safety" "metaworld" "calvin" "isaaclab" "robocasa" "franka" "franka-dexhand" "franka-franky" "frankasim" "robotwin" "habitat" "opensora" "wan" "genesis" "xsquare_turtle2" "liberopro" "liberoplus" "roboverse" "embodichain" "d4rl" "dosw1" "gim_arm" "dummy" "polaris")
 
 #=======================Utility Functions=======================
 
@@ -1272,6 +1272,13 @@ install_openpi_model() {
             uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
             install_flash_attn
             ;;
+        libero_safety)
+            create_and_sync_venv
+            install_common_embodied_deps
+            install_libero_safety_env
+            uv pip install git+${GITHUB_PREFIX}https://github.com/RLinf/openpi
+            install_flash_attn
+            ;;
         metaworld)
             create_and_sync_venv
             install_common_embodied_deps
@@ -1678,6 +1685,10 @@ install_env_only() {
             install_common_embodied_deps
             install_habitat_env
             ;;
+        libero_safety)
+            install_common_embodied_deps
+            install_libero_safety_env
+            ;;
         genesis)
             install_common_embodied_deps
             install_genesis_env
@@ -1717,6 +1728,46 @@ install_libero_env() {
     uv pip install -e "$libero_dir"
     uv pip install "mujoco<=3.9.0"
     echo "export PYTHONPATH=$(realpath "$libero_dir"):\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
+}
+
+install_libero_safety_env() {
+    local libero_safety_dir
+    libero_safety_dir=$(clone_or_reuse_repo LIBERO_SAFETY_PATH "$VENV_DIR/libero_safety" https://github.com/LIBERO-SAFETY/LIBERO-Safety.git)
+
+    local libero_safety_core="$libero_safety_dir/libero/libero"
+    local libero_safety_assets="$libero_safety_core/assets"
+    local assets_sentinel="$libero_safety_assets/scenes/libero_kitchen_tabletop_base_style.xml"
+    local assets_archive="$libero_safety_dir/assets.zip"
+
+    if [ -f "$assets_sentinel" ]; then
+        echo "[install.sh] LIBERO-Safety assets already exist at $libero_safety_assets, skipping download."
+    else
+        if ! command -v unzip > /dev/null 2>&1; then
+            echo "unzip is required to install LIBERO-Safety assets." >&2
+            return 1
+        fi
+
+        echo "[install.sh] Downloading LIBERO-Safety assets from Hugging Face..."
+        "$VENV_DIR/bin/hf" download LIBERO-Safety/libero_safety_assets assets.zip \
+            --repo-type dataset \
+            --revision main \
+            --local-dir "$libero_safety_dir"
+        unzip -q -o "$assets_archive" -d "$libero_safety_core"
+
+        if [ ! -f "$assets_sentinel" ]; then
+            echo "LIBERO-Safety assets were extracted, but the required scene file is missing: $assets_sentinel" >&2
+            return 1
+        fi
+        rm -f "$assets_archive"
+    fi
+
+    uv pip uninstall libero robosuite || true
+    uv pip install -e "$libero_safety_dir/third_party/robosuite-1.4"
+    uv pip install -e "$libero_safety_dir"
+    uv pip install -r "$libero_safety_dir/extra_requirements.txt"
+    uv pip install "mujoco<=3.9.0"
+    echo "export LIBERO_SAFETY_REPO_PATH=$(realpath "$libero_safety_dir")" >> "$VENV_DIR/bin/activate"
+    echo "export PYTHONPATH=$(realpath "$libero_safety_dir"):\$PYTHONPATH" >> "$VENV_DIR/bin/activate"
 }
 
 install_maniskill_libero_env() {

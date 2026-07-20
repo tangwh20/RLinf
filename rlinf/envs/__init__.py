@@ -12,13 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import sys
+import tempfile
+import types
 from enum import Enum
+from pathlib import Path
+
+import yaml
 
 
 class SupportedEnvType(Enum):
     MANISKILL = "maniskill"
     MANISKILL_RLT = "maniskill_rlt"
     LIBERO = "libero"
+    LIBERO_SAFETY = "libero_safety"
     ROBOTWIN = "robotwin"
     ISAACLAB = "isaaclab"
     METAWORLD = "metaworld"
@@ -35,6 +43,68 @@ class SupportedEnvType(Enum):
     ROBOVERSE = "roboverse"
     D4RL = "d4rl"
     POLARIS = "polaris"
+
+
+def _configure_libero_safety(env_cfg) -> Path:
+    """Route the import-compatible ``libero`` package to LIBERO-Safety."""
+    configured_path = env_cfg.get("repo_path", None) if env_cfg is not None else None
+    repo_path = (
+        Path(
+            configured_path
+            or os.environ.get("LIBERO_SAFETY_REPO_PATH", "")
+            or Path(__file__).resolve().parents[2].parent / "LIBERO-Safety"
+        )
+        .expanduser()
+        .resolve()
+    )
+    core_path = repo_path / "libero" / "libero"
+    if not (core_path / "benchmark" / "vla_safety_task_map.py").is_file():
+        raise FileNotFoundError(
+            "LIBERO-Safety source was not found. Set env.*.repo_path or "
+            f"LIBERO_SAFETY_REPO_PATH to its repository root (resolved: {repo_path})."
+        )
+
+    config_dir = Path(tempfile.gettempdir()) / f"rlinf_libero_safety_{os.getpid()}"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path_config = {
+        "assets": str(core_path / "assets"),
+        "bddl_files": str(core_path / "bddl_files"),
+        "benchmark_root": str(core_path),
+        "datasets": str(repo_path / "libero" / "datasets"),
+        "init_states": str(core_path / "init_files"),
+    }
+    with (config_dir / "config.yaml").open("w", encoding="utf-8") as config_file:
+        yaml.safe_dump(path_config, config_file)
+
+    os.environ["LIBERO_CONFIG_PATH"] = str(config_dir)
+    os.environ["LIBERO_SAFETY_REPO_PATH"] = str(repo_path)
+    os.environ["LIBERO_TYPE"] = "safety"
+    repo_str = str(repo_path)
+    sys.path[:] = [path for path in sys.path if path != repo_str]
+    sys.path.insert(0, repo_str)
+
+    loaded_benchmark = sys.modules.get("libero.libero.benchmark")
+    loaded_file = (
+        getattr(loaded_benchmark, "__file__", "") if loaded_benchmark else ""
+    )
+    benchmark_is_safety = bool(
+        loaded_file and Path(loaded_file).resolve().is_relative_to(repo_path)
+    )
+    if not benchmark_is_safety:
+        for module_name in list(sys.modules):
+            if module_name == "libero" or module_name.startswith("libero."):
+                del sys.modules[module_name]
+
+        # LIBERO-Safety's outer ``libero/`` directory has no __init__.py. A
+        # separately installed standard LIBERO is therefore preferred as a
+        # regular package over this namespace portion, even when repo_path is
+        # first on sys.path. Pin the namespace explicitly to the Safety tree.
+        safety_namespace = types.ModuleType("libero")
+        safety_namespace.__file__ = None
+        safety_namespace.__package__ = "libero"
+        safety_namespace.__path__ = [str(repo_path / "libero")]
+        sys.modules["libero"] = safety_namespace
+    return repo_path
 
 
 def get_env_cls(env_type: str, env_cfg=None):
@@ -68,6 +138,11 @@ def get_env_cls(env_type: str, env_cfg=None):
         from rlinf.envs.libero.libero_env import LiberoEnv
 
         return LiberoEnv
+    elif env_type == SupportedEnvType.LIBERO_SAFETY:
+        _configure_libero_safety(env_cfg)
+        from rlinf.envs.libero_safety.libero_safety_env import LiberoSafetyEnv
+
+        return LiberoSafetyEnv
     elif env_type == SupportedEnvType.ROBOTWIN:
         from rlinf.envs.robotwin.robotwin_env import RoboTwinEnv
 

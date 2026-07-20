@@ -1,0 +1,96 @@
+defaults:
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: all
+
+runner:
+  task_type: sft
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_safety_sft_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+  max_epochs: -1
+  max_steps: 5000
+  val_check_interval: -1
+  save_interval: 500
+
+data:
+  train_data_paths:
+    - dataset_path: "LIBERO-Safety/libero_safety"
+      weight: 1.0
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 256
+  seed: 0
+
+  model:
+    precision: null
+    model_path: "/mnt/public/tangwenhao/ckpt/rlt-pi05/pi05_base_pytorch/"
+    model_type: "openpi"
+    num_action_chunks: 10
+    action_dim: 7
+    add_value_head: False
+
+    openpi_data:
+      repo_id: "LIBERO-Safety/libero_safety"
+      norm_stats_path: "/mnt/public/tangwenhao/huggingface/lerobot/LIBERO-Safety/libero_safety/norm_stats.json"
+
+    openpi:
+      config_name: "pi05_libero_safety"
+      num_images_in_input: 2
+      train_expert_only: False
+      detach_critic_input: True
+      action_horizon: 10
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+
+      # Standard OpenPI behavior-cloning objective.
+      use_rlt: False
+
+  optim:
+    lr: 2.5e-5
+    value_lr: 1.55e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-08
+    weight_decay: 1.0e-10
+    clip_grad: 1.0
+    total_training_steps: 10000
+    lr_warmup_steps: 500
+    lr_scheduler: "cosine"
+    num_cycles: 0.5
+    min_lr: 2.5e-6
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "no_shard"
+    use_orig_params: False
+    gradient_checkpointing: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

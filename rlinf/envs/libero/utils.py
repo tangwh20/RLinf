@@ -14,6 +14,7 @@
 
 """Utils for evaluating policies in LIBERO simulation environments."""
 
+import importlib
 import math
 import os
 from typing import TYPE_CHECKING, Union
@@ -149,23 +150,56 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
         Benchmark class
     """
     name = str(benchmark_name).lower()
-    if name != "libero_130":
-        return benchmark.get_benchmark(benchmark_name)
+    active_benchmark = benchmark
+    if get_libero_type() == "safety":
+        # LIBERO may have been imported before get_env_cls() routes imports to
+        # LIBERO-Safety. Resolve the active module at call time instead of using
+        # the stale module captured when this utility module was first loaded.
+        active_benchmark = importlib.import_module("libero.libero.benchmark")
 
-    libero_cls = benchmark.BENCHMARK_MAPPING.get("libero_130", None)
+    if name == "libero_safety":
+        safety_cls = active_benchmark.BENCHMARK_MAPPING.get(name)
+        if safety_cls is not None:
+            return safety_cls
+
+        safety_suites = (
+            "affordance",
+            "human_safety",
+            "obstacle_avoidance",
+            "obstacle_avoidance_human",
+        )
+        tasks = []
+        for suite_name in safety_suites:
+            suite = active_benchmark.get_benchmark(suite_name)()
+            tasks.extend(suite.tasks)
+
+        class LIBERO_SAFETY(active_benchmark.Benchmark):
+            def __init__(self, task_order_index=0):
+                super().__init__(task_order_index=task_order_index)
+                self.name = name
+                self.tasks = list(tasks)
+                self.n_tasks = len(self.tasks)
+
+        active_benchmark.BENCHMARK_MAPPING[name] = LIBERO_SAFETY
+        return LIBERO_SAFETY
+
+    if name != "libero_130":
+        return active_benchmark.get_benchmark(benchmark_name)
+
+    libero_cls = active_benchmark.BENCHMARK_MAPPING.get("libero_130", None)
     if libero_cls is not None:
         return libero_cls
 
     # Build aggregated task map once, preserving order and de-duplicating by task name
-    aggregated_task_map: dict[str, benchmark.Task] = {}
-    suites = getattr(benchmark, "libero_suites", [])
+    aggregated_task_map: dict[str, active_benchmark.Task] = {}
+    suites = getattr(active_benchmark, "libero_suites", [])
     for suite_name in suites:
-        suite_map = benchmark.task_maps.get(suite_name, {})
+        suite_map = active_benchmark.task_maps.get(suite_name, {})
         for task_name, task in suite_map.items():
             if task_name not in aggregated_task_map:
                 aggregated_task_map[task_name] = task
 
-    class LIBERO_ALL(Benchmark):
+    class LIBERO_ALL(active_benchmark.Benchmark):
         def __init__(self, task_order_index=0):
             super().__init__(task_order_index=task_order_index)
             self.name = "libero_130"
@@ -177,7 +211,7 @@ def get_benchmark_overridden(benchmark_name) -> Benchmark:
             self.n_tasks = len(self.tasks)
 
     # Register for discoverability/help
-    benchmark.BENCHMARK_MAPPING["libero_130"] = LIBERO_ALL
+    active_benchmark.BENCHMARK_MAPPING["libero_130"] = LIBERO_ALL
     return LIBERO_ALL
 
 

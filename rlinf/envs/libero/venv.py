@@ -156,7 +156,14 @@ def _worker(
             elif cmd == "reconfigure":
                 env.close()
                 seed = data.pop("seed")
-                env = OffScreenRenderEnv(**data)
+                worker_env_cls = OffScreenRenderEnv
+                if get_libero_type() == "safety":
+                    from libero.libero.envs import (
+                        OffScreenRenderEnv as SafetyOffScreenRenderEnv,
+                    )
+
+                    worker_env_cls = SafetyOffScreenRenderEnv
+                env = worker_env_cls(**data)
                 env.seed(seed)
                 p.send(None)
             else:

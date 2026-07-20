@@ -177,6 +177,7 @@
 
    ManiSkill <embodied/maniskill>
    LIBERO <embodied/libero>
+   LIBERO-Safety <embodied/libero_safety>
    Behavior <embodied/behavior>
    MetaWorld <embodied/metaworld>
    IsaacLab <embodied/isaaclab>

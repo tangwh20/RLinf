@@ -31,7 +31,12 @@ from rlinf.algorithms.utils import (
 from rlinf.config import SupportedModel, torch_dtype_from_precision
 from rlinf.data.embodied_io_struct import Trajectory, convert_trajectories_to_batch
 from rlinf.data.io_struct import BatchResizingIterator, RolloutResult
-from rlinf.data.lerobot_paths import resolve_lerobot_repo_id
+from rlinf.data.lerobot_paths import (
+    ensure_hf_datasets_list_feature_compat,
+    install_quiet_openpi_data_worker_init,
+    resolve_lerobot_repo_id,
+    suppress_torchcodec_info_logs,
+)
 from rlinf.hybrid_engines.fsdp.fsdp_model_manager import FSDPModelManager
 from rlinf.hybrid_engines.fsdp.utils import (
     pack_fsdp_input,
@@ -1278,7 +1283,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     "LeRobot repo id when enable_sft_co_train=True."
                 )
 
+            ensure_hf_datasets_list_feature_compat()
+            suppress_torchcodec_info_logs()
             import openpi.training.data_loader as _data
+
+            install_quiet_openpi_data_worker_init(_data)
 
             from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
 

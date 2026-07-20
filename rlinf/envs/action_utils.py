@@ -280,7 +280,7 @@ def prepare_actions(
         raw_chunk_actions = raw_chunk_actions.numpy()
 
     env_type = SupportedEnvType(env_type)
-    if env_type == SupportedEnvType.LIBERO:
+    if env_type in (SupportedEnvType.LIBERO, SupportedEnvType.LIBERO_SAFETY):
         chunk_actions = prepare_actions_for_libero(
             raw_chunk_actions=raw_chunk_actions,
             model_type=model_type,
