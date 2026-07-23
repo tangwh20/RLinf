@@ -18,7 +18,10 @@ from pathlib import Path
 
 import numpy as np
 
-from rlinf.envs.libero_safety.metrics import aggregate_constraint_costs
+from rlinf.envs.libero_safety.metrics import (
+    aggregate_constraint_costs,
+    classify_safety_success,
+)
 
 
 def test_aggregate_constraint_costs_uses_any_violated_predicate():
@@ -32,6 +35,16 @@ def test_aggregate_constraint_costs_uses_any_violated_predicate():
     )
 
     np.testing.assert_array_equal(costs, np.array([0, 1, 0, 0], dtype=np.float32))
+
+
+def test_classify_safety_success_reports_joint_outcomes():
+    safe_success, unsafe_success = classify_safety_success(
+        np.array([True, True, False, False]),
+        np.array([False, True, False, True]),
+    )
+
+    np.testing.assert_array_equal(safe_success, [True, False, False, False])
+    np.testing.assert_array_equal(unsafe_success, [False, True, False, False])
 
 
 def test_configure_safety_purges_standard_namespace_package(monkeypatch, tmp_path):

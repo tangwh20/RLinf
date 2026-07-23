@@ -161,6 +161,7 @@ class LiberoEnv(gym.Env):
 
         current_type_val = get_libero_type()
         safety_repo_path = os.environ.get("LIBERO_SAFETY_REPO_PATH")
+        standard_repo_path = os.environ.get("LIBERO_REPO_PATH")
 
         for env_fn_param in env_fn_params:
 
@@ -168,15 +169,26 @@ class LiberoEnv(gym.Env):
                 param=env_fn_param,
                 _type_val=current_type_val,
                 _safety_repo_path=safety_repo_path,
+                _standard_repo_path=standard_repo_path,
             ):
                 os.environ["LIBERO_TYPE"] = _type_val
                 seed = param.pop("seed")
+                controller_profile = param.pop(
+                    "_rlinf_controller_profile", "native"
+                )
 
                 if _type_val == "safety":
                     from rlinf.envs import _configure_libero_safety
 
                     _configure_libero_safety({"repo_path": _safety_repo_path})
-                    from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
+                    if param.pop("counterfactual_obstacle_eval", False):
+                        from rlinf.envs.libero_safety.ghost_obstacle_env import (
+                            GhostObstacleOffScreenRenderEnv as WorkerEnv,
+                        )
+                    else:
+                        from libero.libero.envs import (
+                            OffScreenRenderEnv as WorkerEnv,
+                        )
                 elif _type_val in ["pro", "plus"]:
                     sys.path[:] = [p for p in sys.path if "opt/libero" not in p]
 
@@ -211,7 +223,21 @@ class LiberoEnv(gym.Env):
                         print(f"[Worker Env Error] {e}")
                         raise e
                 else:
+                    from rlinf.envs.libero.standard_config import (
+                        configure_standard_libero,
+                    )
+
+                    configure_standard_libero({"repo_path": _standard_repo_path})
                     from libero.libero.envs import OffScreenRenderEnv as WorkerEnv
+
+                if controller_profile != "native":
+                    from rlinf.envs.libero.controller_profile import (
+                        with_controller_profile,
+                    )
+
+                    WorkerEnv = with_controller_profile(
+                        WorkerEnv, controller_profile
+                    )
 
                 env = WorkerEnv(**param)
                 env.seed(seed)
@@ -402,13 +428,24 @@ class LiberoEnv(gym.Env):
                         else:
                             final_path = self._generator.choice(all_candidates)
 
-            env_fn_params.append(
-                {
-                    **base_env_args,
-                    "bddl_file_name": final_path,
-                    "seed": self.seed,
-                }
+            env_params = {
+                **base_env_args,
+                "bddl_file_name": final_path,
+                "seed": self.seed,
+            }
+            env_params["_rlinf_controller_profile"] = (
+                "standard"
+                if variant == "standard"
+                else self.cfg.get("controller_profile", "native")
             )
+            if variant == "safety" and self.cfg.get(
+                "counterfactual_obstacle_eval", False
+            ):
+                env_params["counterfactual_obstacle_eval"] = True
+                env_params["ghost_contact_margin"] = float(
+                    self.cfg.get("ghost_contact_margin", 0.0)
+                )
+            env_fn_params.append(env_params)
             task_descriptions.append(task.language)
 
         self.task_descriptions = task_descriptions

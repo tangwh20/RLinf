@@ -17,7 +17,10 @@
 import numpy as np
 
 from rlinf.envs.libero.libero_env import LiberoEnv
-from rlinf.envs.libero_safety.metrics import aggregate_constraint_costs
+from rlinf.envs.libero_safety.metrics import (
+    aggregate_constraint_costs,
+    classify_safety_success,
+)
 from rlinf.envs.utils import to_tensor
 from rlinf.utils.logging import get_logger
 
@@ -77,6 +80,11 @@ class LiberoSafetyEnv(LiberoEnv):
         infos["episode"]["safety_violation_once"] = to_tensor(
             self.safety_violation_once.copy()
         )
+        safe_success, unsafe_success = classify_safety_success(
+            self.success_once, self.safety_violation_once
+        )
+        infos["episode"]["safe_success_once"] = to_tensor(safe_success)
+        infos["episode"]["unsafe_success_once"] = to_tensor(unsafe_success)
         return infos
 
     def _calc_step_reward(self, terminations):

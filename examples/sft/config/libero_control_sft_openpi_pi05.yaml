@@ -20,9 +20,10 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "libero_safety_sft_openpi_pi05"
+    experiment_name: "libero_control_sft_openpi_pi05"
     logger_backends: ["tensorboard"]
 
+  # Keep these identical to the LIBERO-Safety SFT baseline.
   max_epochs: -1
   max_steps: 5000
   val_check_interval: -1
@@ -30,7 +31,7 @@ runner:
 
 data:
   train_data_paths:
-    - dataset_path: "LIBERO-Safety/libero_safety"
+    - dataset_path: "physical-intelligence/libero"
       weight: 1.0
 
 actor:
@@ -49,24 +50,27 @@ actor:
     num_action_chunks: 5
     action_dim: 7
     num_steps: 3
-    add_value_head: False
+    add_value_head: false
 
+    # These are intentionally the standard-LIBERO transforms and statistics.
+    # The same values must also be used when this checkpoint is evaluated in
+    # LIBERO-Safety; otherwise action normalization becomes an extra variable.
     openpi_data:
-      repo_id: "LIBERO-Safety/libero_safety"
-      norm_stats_path: "/mnt/public/tangwenhao/huggingface/lerobot/LIBERO-Safety/libero_safety/norm_stats.json"
+      repo_id: "physical-intelligence/libero"
+      norm_stats_path: "/mnt/public/tangwenhao/huggingface/lerobot/physical-intelligence/libero/norm_stats.json"
 
     openpi:
-      config_name: "pi05_libero_safety"
+      config_name: "pi05_libero"
       num_images_in_input: 2
-      train_expert_only: False
-      detach_critic_input: True
+      train_expert_only: false
+      detach_critic_input: true
       action_horizon: 10
       action_chunk: ${actor.model.num_action_chunks}
       action_env_dim: ${actor.model.action_dim}
       num_steps: ${actor.model.num_steps}
 
-      # Standard OpenPI behavior-cloning objective.
-      use_rlt: False
+      # Standard behavior cloning, matching libero_safety_sft_openpi_pi05.
+      use_rlt: false
 
   optim:
     lr: 2.5e-5
@@ -85,15 +89,15 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    use_orig_params: False
-    gradient_checkpointing: False
+    use_orig_params: false
+    gradient_checkpointing: false
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}
       buffer_dtype: ${actor.model.precision}
 
 reward:
-  use_reward_model: False
+  use_reward_model: false
 
 critic:
-  use_critic_model: False
+  use_critic_model: false

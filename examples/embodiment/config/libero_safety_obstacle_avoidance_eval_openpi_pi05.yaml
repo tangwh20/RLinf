@@ -1,0 +1,123 @@
+# Unified LIBERO-Safety evaluation for pi0.5 SFT and PPO checkpoints.
+#
+# Safety-trained SFT/PPO (default): set only LIBERO_EVAL_CHECKPOINT. The
+# defaults below use pi05_libero_safety, Safety norm stats, and native control.
+# Run: LIBERO_EVAL_CHECKPOINT=/path/to/global_step_N \
+#   bash examples/embodiment/run_embodiment.sh \
+#   libero_safety_obstacle_avoidance_eval_openpi_pi05
+#
+#
+# Standard-LIBERO SFT/PPO: set LIBERO_EVAL_CHECKPOINT plus:
+#   LIBERO_EVAL_CONTROLLER_PROFILE=standard
+#   LIBERO_EVAL_UNNORM_KEY=libero
+#   LIBERO_EVAL_REPO_ID=physical-intelligence/libero
+#   LIBERO_EVAL_NORM_STATS_PATH=/path/to/physical-intelligence/libero/norm_stats.json
+#   LIBERO_EVAL_OPENPI_CONFIG=pi05_libero
+#
+# Ghost evaluation: additionally set LIBERO_EVAL_GHOST=true. Obstacles remain
+# visible and contacts are measured, but obstacle contact forces are disabled.
+# LIBERO_EVAL_GHOST_MARGIN optionally changes the geometric contact margin.
+
+defaults:
+  - env/libero_safety@env.eval
+  - model/pi0_5@rollout.model
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env,rollout: all
+
+runner:
+  task_type: embodied_eval
+  only_eval: true
+  val_check_interval: -1
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "libero_safety_obstacle_avoidance_eval_openpi_pi05"
+    logger_backends: ["tensorboard"]
+
+algorithm:
+  # Evaluation does not calculate advantages, but EnvWorker uses these fields
+  # when constructing its common rollout metadata.
+  adv_type: gae
+  reward_type: chunk_level
+  group_size: 1
+  gamma: 0.99
+  gae_lambda: 0.95
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    task_suite_name: obstacle_avoidance
+    counterfactual_obstacle_eval: ${oc.decode:${oc.env:LIBERO_EVAL_GHOST,false}}
+    ghost_contact_margin: ${oc.decode:${oc.env:LIBERO_EVAL_GHOST_MARGIN,0.0}}
+    controller_profile: ${oc.env:LIBERO_EVAL_CONTROLLER_PROFILE,native}
+    # The suite contains 15 tasks x 50 initial states. With 64 parallel envs,
+    # 12 rounds enumerate all 750 trials; exhausted slots are masked out.
+    rollout_epoch: 12
+    total_num_envs: 64
+    auto_reset: true
+    ignore_terminations: true
+    use_ordered_reset_state_ids: true
+    pad_eval_reset_state_ids: false
+    max_episode_steps: 240
+    max_steps_per_rollout_epoch: 240
+    group_size: 1
+    is_eval: true
+    video_cfg:
+      # Keep the 750-trial benchmark fast; turn this on only for visual debugging.
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "huggingface"
+  recompute_logprobs: false
+  unnorm_key: ${oc.env:LIBERO_EVAL_UNNORM_KEY,libero_safety}
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+
+  model:
+    # Set this to a global_step_N directory produced by SFT or PPO.
+    model_path: ${oc.env:LIBERO_EVAL_CHECKPOINT}
+    precision: null
+    model_type: "openpi"
+    num_action_chunks: 5
+    action_dim: 7
+    use_proprio: true
+    num_steps: 3
+    add_value_head: false
+    openpi_data:
+      repo_id: ${oc.env:LIBERO_EVAL_REPO_ID,LIBERO-Safety/libero_safety}
+      norm_stats_path: ${oc.env:LIBERO_EVAL_NORM_STATS_PATH,/mnt/public/tangwenhao/huggingface/lerobot/LIBERO-Safety/libero_safety/norm_stats.json}
+    openpi:
+      config_name: ${oc.env:LIBERO_EVAL_OPENPI_CONFIG,pi05_libero_safety}
+      num_images_in_input: 2
+      noise_level: 0.5
+      action_chunk: ${..num_action_chunks}
+      num_steps: ${..num_steps}
+      train_expert_only: false
+      action_env_dim: ${..action_dim}
+      noise_method: "flow_sde"
+      add_value_head: false
+      value_after_vlm: false
+      detach_critic_input: true
+      action_horizon: 10
+      use_rlt: false
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

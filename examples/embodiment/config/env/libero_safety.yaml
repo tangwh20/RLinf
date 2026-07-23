@@ -13,6 +13,15 @@ use_step_penalty: False
 reward_coef: 1.0
 safety_cost_coef: 1.0
 
+# Evaluation-only counterfactual mode. Constrained obstacles remain visible,
+# exert no contact forces, and are checked geometrically around each control step.
+counterfactual_obstacle_eval: False
+ghost_contact_margin: 0.0
+
+# "native" preserves LIBERO-Safety data-collection dynamics. Use "standard"
+# only when evaluating a standard-LIBERO policy in the Safety environment.
+controller_profile: native
+
 # Repository root. null resolves to ../LIBERO-Safety or LIBERO_SAFETY_REPO_PATH.
 repo_path: null
 

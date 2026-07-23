@@ -156,13 +156,31 @@ def _worker(
             elif cmd == "reconfigure":
                 env.close()
                 seed = data.pop("seed")
+                controller_profile = data.pop(
+                    "_rlinf_controller_profile", "native"
+                )
                 worker_env_cls = OffScreenRenderEnv
                 if get_libero_type() == "safety":
-                    from libero.libero.envs import (
-                        OffScreenRenderEnv as SafetyOffScreenRenderEnv,
+                    if data.pop("counterfactual_obstacle_eval", False):
+                        from rlinf.envs.libero_safety.ghost_obstacle_env import (
+                            GhostObstacleOffScreenRenderEnv,
+                        )
+
+                        worker_env_cls = GhostObstacleOffScreenRenderEnv
+                    else:
+                        from libero.libero.envs import (
+                            OffScreenRenderEnv as SafetyOffScreenRenderEnv,
+                        )
+
+                        worker_env_cls = SafetyOffScreenRenderEnv
+                if controller_profile != "native":
+                    from rlinf.envs.libero.controller_profile import (
+                        with_controller_profile,
                     )
 
-                    worker_env_cls = SafetyOffScreenRenderEnv
+                    worker_env_cls = with_controller_profile(
+                        worker_env_cls, controller_profile
+                    )
                 env = worker_env_cls(**data)
                 env.seed(seed)
                 p.send(None)

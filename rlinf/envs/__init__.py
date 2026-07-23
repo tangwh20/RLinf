@@ -48,14 +48,19 @@ class SupportedEnvType(Enum):
 def _configure_libero_safety(env_cfg) -> Path:
     """Route the import-compatible ``libero`` package to LIBERO-Safety."""
     configured_path = env_cfg.get("repo_path", None) if env_cfg is not None else None
+    project_root = Path(__file__).resolve().parents[2]
+    default_candidates = (
+        project_root.parent / "LIBERO-Safety",
+        project_root / ".venv" / "libero_safety",
+    )
+    requested_path = configured_path or os.environ.get("LIBERO_SAFETY_REPO_PATH")
     repo_path = (
-        Path(
-            configured_path
-            or os.environ.get("LIBERO_SAFETY_REPO_PATH", "")
-            or Path(__file__).resolve().parents[2].parent / "LIBERO-Safety"
+        Path(requested_path).expanduser().resolve()
+        if requested_path
+        else next(
+            (path.resolve() for path in default_candidates if path.is_dir()),
+            default_candidates[0].resolve(),
         )
-        .expanduser()
-        .resolve()
     )
     core_path = repo_path / "libero" / "libero"
     if not (core_path / "benchmark" / "vla_safety_task_map.py").is_file():
@@ -135,6 +140,9 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return ManiskillRLTEnv
     elif env_type == SupportedEnvType.LIBERO:
+        from rlinf.envs.libero.standard_config import configure_standard_libero
+
+        configure_standard_libero(env_cfg)
         from rlinf.envs.libero.libero_env import LiberoEnv
 
         return LiberoEnv

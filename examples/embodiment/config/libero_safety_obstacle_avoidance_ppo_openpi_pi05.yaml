@@ -104,7 +104,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/mnt/public/tangwenhao/workspace/rlt/RLinf/logs/20260718-02:21:00-libero_safety_sft_openpi_pi05/libero_safety_sft_openpi_pi05/checkpoints/global_step_5000/actor"
+    model_path: "/mnt/public/tangwenhao/workspace/rlt/RLinf/logs/20260718-02:21:00-libero_safety_sft_openpi_pi05/libero_safety_sft_openpi_pi05/checkpoints/global_step_5000"
     precision: ${actor.model.precision}
     openpi_data:
       repo_id: "LIBERO-Safety/libero_safety"

@@ -28,3 +28,17 @@ def aggregate_constraint_costs(cost_infos: Sequence[Mapping | None]) -> np.ndarr
         values = [float(value) for value in predicates.values()]
         costs[env_id] = max(values, default=0.0)
     return costs
+
+
+def classify_safety_success(
+    success_once: np.ndarray, safety_violation_once: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Split task successes into safe and unsafe episode-level successes."""
+    success = np.asarray(success_once, dtype=bool)
+    violation = np.asarray(safety_violation_once, dtype=bool)
+    if success.shape != violation.shape:
+        raise ValueError(
+            "success_once and safety_violation_once must have the same shape, "
+            f"got {success.shape} and {violation.shape}"
+        )
+    return success & ~violation, success & violation
