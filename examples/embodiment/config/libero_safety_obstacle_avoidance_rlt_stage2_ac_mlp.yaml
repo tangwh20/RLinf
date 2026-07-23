@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf-rlt
-    experiment_name: "libero_safety_rlt_stage2_ac_mlp"
+    experiment_name: "libero_safety_obstacle_avoidance_rlt_stage2_ac_mlp"
     logger_backends: ["tensorboard"]
 
   max_epochs: 5000
@@ -98,6 +98,7 @@ algorithm:
 env:
   group_name: "EnvGroup"
   train:
+    task_suite_name: obstacle_avoidance
     rollout_epoch: 1
     total_num_envs: 64
     seed: 2026
@@ -118,9 +119,10 @@ env:
       video_base_dir: ${runner.logger.log_path}/video/train
 
   eval:
+    task_suite_name: obstacle_avoidance
     # LIBERO uses one MuJoCo/EGL subprocess per environment. Keep 64 live
-    # evaluators and cover all 3000 trials across 47 sequential rounds.
-    rollout_epoch: 47
+    # evaluators and cover all 750 trials across 12 sequential rounds.
+    rollout_epoch: 12
     total_num_envs: 64
     seed: 2026
     auto_reset: True
@@ -129,7 +131,7 @@ env:
     ignore_terminations: True
     use_fixed_reset_state_ids: True
     use_ordered_reset_state_ids: True
-    # 64 x 47 produces 3008 slots. The final 8 repeated trials are excluded
+    # 64 x 12 produces 768 slots. The final 18 repeated trials are excluded
     # by LIBERO's task/trial metric deduplication.
     pad_eval_reset_state_ids: True
     use_rel_reward: False
