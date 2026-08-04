@@ -59,6 +59,27 @@ EXTRA_OVERRIDES=""
 [ -n "${SAVE_INTER:-}" ] && [ "$SAVE_INTER" != "-2" ] && EXTRA_OVERRIDES+=" runner.save_interval=${SAVE_INTER}"
 [ -n "${NODES:-}" ]      && [ "$NODES"      != "-2" ] && EXTRA_OVERRIDES+=" cluster.num_nodes=${NODES}"
 
+if [ "${CONFIG_NAME}" = "d4rl_ogpo_relocate" ]; then
+    export D4RL_SUPPRESS_IMPORT_ERROR="${D4RL_SUPPRESS_IMPORT_ERROR:-1}"
+    export MUJOCO_PY_MUJOCO_PATH="${MUJOCO_PY_MUJOCO_PATH:-${MUJOCO_PATH:-${HOME}/.mujoco}/mujoco210}"
+    OGPO_RELOCATE_DATASET="${OGPO_RELOCATE_DATASET:-${REPO_PATH}/../datasets/relocate-expert-minari-v2.hdf5}"
+
+    if [ ! -f "${MUJOCO_PY_MUJOCO_PATH}/bin/libmujoco210.so" ]; then
+        echo "MuJoCo 2.1 runtime not found: ${MUJOCO_PY_MUJOCO_PATH}" >&2
+        echo "Set MUJOCO_PY_MUJOCO_PATH to a MuJoCo 2.1 installation." >&2
+        exit 1
+    fi
+    if [ ! -f "${OGPO_RELOCATE_DATASET}" ]; then
+        echo "OGPO Relocate dataset not found: ${OGPO_RELOCATE_DATASET}" >&2
+        echo "Set OGPO_RELOCATE_DATASET to the converted expert HDF5 file." >&2
+        exit 1
+    fi
+
+    export MUJOCO_PY_MUJOCO_PATH="$(cd "${MUJOCO_PY_MUJOCO_PATH}" && pwd -P)"
+    export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:+${LD_LIBRARY_PATH}:}${MUJOCO_PY_MUJOCO_PATH}/bin"
+    EXTRA_OVERRIDES+=" data.dataset_path=${OGPO_RELOCATE_DATASET}"
+fi
+
 CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}${EXTRA_OVERRIDES}"
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}

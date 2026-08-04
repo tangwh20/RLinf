@@ -85,7 +85,18 @@ class D4RLEnv(gym.Env):
         self.ignore_terminations = bool(_cfg_get(cfg, "ignore_terminations", False))
         self.use_rel_reward = bool(_cfg_get(cfg, "use_rel_reward", False))
         self.video_cfg = _cfg_get(cfg, "video_cfg", None)
-        self.max_episode_steps = _cfg_get(cfg, "max_steps_per_rollout_epoch", None)
+        self.episode_metric_schema = str(
+            _cfg_get(cfg, "episode_metric_schema", "default")
+        )
+        self.use_seeded_reset = bool(_cfg_get(cfg, "use_seeded_reset", True))
+        if self.episode_metric_schema == "ogpo":
+            self.max_episode_steps = _cfg_get(
+                cfg,
+                "max_episode_steps",
+                _cfg_get(cfg, "max_steps_per_rollout_epoch", None),
+            )
+        else:
+            self.max_episode_steps = _cfg_get(cfg, "max_steps_per_rollout_epoch", None)
         self.max_episode_steps = (
             int(self.max_episode_steps) if self.max_episode_steps is not None else None
         )
@@ -139,6 +150,10 @@ class D4RLEnv(gym.Env):
         # Per-env episode stats (used when record_metrics=True).
         self._reward_sum = np.zeros((self.num_envs,), dtype=np.float32)
         self._episode_length = np.zeros((self.num_envs,), dtype=np.int64)
+        # Diagnostic only: official OGPO uses success on the terminal frame,
+        # rather than whether success occurred at any point in the episode.
+        if self.episode_metric_schema == "ogpo":
+            self._episode_success = np.zeros((self.num_envs,), dtype=bool)
         self._start_time = np.array([time.time()] * self.num_envs, dtype=np.float64)
         self._total_timesteps = 0
         self._elapsed_steps = np.zeros((self.num_envs,), dtype=np.int32)
@@ -190,7 +205,7 @@ class D4RLEnv(gym.Env):
 
     @property
     def info_logging_keys(self) -> list[str]:
-        return []
+        return ["success"] if self.episode_metric_schema == "ogpo" else []
 
     def close(self) -> None:
         if self._score_env is not None:
@@ -293,14 +308,18 @@ class D4RLEnv(gym.Env):
 
         obs_chunks: list[np.ndarray] = []
         for idx, state_id in zip(env_idx, reset_state_ids):
-            try:
-                reset_out = self.env.reset(
-                    id=[int(idx)], seed=int(self.seed + int(state_id))
-                )
-            except TypeError as exc:
-                # Old Gym Mujoco reset does not accept `seed` kwarg.
-                if "unexpected keyword argument 'seed'" not in str(exc):
-                    raise
+            if self.use_seeded_reset:
+                try:
+                    reset_out = self.env.reset(
+                        id=[int(idx)], seed=int(self.seed + int(state_id))
+                    )
+                except TypeError as exc:
+                    if "unexpected keyword argument 'seed'" not in str(exc):
+                        raise
+                    reset_out = self.env.reset(id=[int(idx)])
+            else:
+                # Old Gym errors inside SubprocVectorEnv before the parent can
+                # retry. OGPO opts out explicitly after seeding each env once.
                 reset_out = self.env.reset(id=[int(idx)])
             if isinstance(reset_out, tuple):
                 obs = reset_out[0]
@@ -397,6 +416,8 @@ class D4RLEnv(gym.Env):
         if self.record_metrics:
             self._reward_sum[stat_env_idx] = 0.0
             self._episode_length[stat_env_idx] = 0
+            if self.episode_metric_schema == "ogpo":
+                self._episode_success[stat_env_idx] = False
             self._start_time[stat_env_idx] = time.time()
         self._elapsed_steps[stat_env_idx] = 0
         self.prev_step_reward[stat_env_idx] = 0.0
@@ -414,9 +435,18 @@ class D4RLEnv(gym.Env):
             if isinstance(actions, torch.Tensor)
             else actions
         )
-        obs, rewards, terminations, truncations, _ = self._vector_step(
+        obs, rewards, terminations, truncations, raw_infos = self._vector_step(
             np.asarray(acts_np)
         )
+        if self.episode_metric_schema == "ogpo":
+            step_success = np.asarray(
+                [
+                    bool(info.get("goal_achieved", info.get("success", False)))
+                    for info in raw_infos
+                ],
+                dtype=bool,
+            )
+            self._episode_success = np.logical_or(self._episode_success, step_success)
         self._elapsed_steps += 1
         if self.max_episode_steps is not None and self.max_episode_steps > 0:
             truncations = np.logical_or(
@@ -436,6 +466,10 @@ class D4RLEnv(gym.Env):
         ep_returns = np.zeros((self.num_envs,), dtype=np.float32)
         ep_lengths = np.zeros((self.num_envs,), dtype=np.float32)
         ep_normalized_scores = np.zeros((self.num_envs,), dtype=np.float32)
+        if self.episode_metric_schema == "ogpo":
+            ep_success = np.zeros((self.num_envs,), dtype=np.float32)
+            ep_success_once = np.zeros((self.num_envs,), dtype=np.float32)
+            ep_durations = np.zeros((self.num_envs,), dtype=np.float32)
         dones = np.logical_or(terminations, truncations)
         if self.record_metrics and np.any(dones):
             ep_returns[dones] = self._reward_sum[dones]
@@ -444,19 +478,46 @@ class D4RLEnv(gym.Env):
             normalized_scores = self._compute_normalized_scores(done_returns)
             if normalized_scores is not None:
                 ep_normalized_scores[dones] = normalized_scores
+            if self.episode_metric_schema == "ogpo":
+                # Match OGPO's EpisodeMonitor + evaluation.py exactly.
+                ep_success[dones] = step_success[dones].astype(np.float32)
+                ep_success_once[dones] = self._episode_success[dones].astype(np.float32)
+                ep_durations[dones] = (time.time() - self._start_time[dones]).astype(
+                    np.float32
+                )
             self._reward_sum[dones] = 0.0
             self._episode_length[dones] = 0
+            if self.episode_metric_schema == "ogpo":
+                self._episode_success[dones] = False
             self._start_time[dones] = time.time()
         if np.any(dones):
             self._elapsed_steps[dones] = 0
             self.prev_step_reward[dones] = 0.0
 
-        infos: dict[str, Any] = {
-            "episode": {
-                "return": torch.as_tensor(ep_normalized_scores, dtype=torch.float32),
-                "episode_len": torch.as_tensor(ep_lengths, dtype=torch.float32),
+        if self.episode_metric_schema == "ogpo":
+            episode_infos = {
+                "return": torch.as_tensor(ep_returns, dtype=torch.float32),
+                "normalized_return": torch.as_tensor(
+                    ep_normalized_scores, dtype=torch.float32
+                ),
+                "length": torch.as_tensor(ep_lengths, dtype=torch.float32),
+                "duration": torch.as_tensor(ep_durations, dtype=torch.float32),
+                "success": torch.as_tensor(ep_success, dtype=torch.float32),
+                "success_once": torch.as_tensor(ep_success_once, dtype=torch.float32),
             }
-        }
+            infos: dict[str, Any] = {
+                "success": torch.as_tensor(ep_success, dtype=torch.float32),
+                "episode": episode_infos,
+            }
+        else:
+            infos = {
+                "episode": {
+                    "return": torch.as_tensor(
+                        ep_normalized_scores, dtype=torch.float32
+                    ),
+                    "episode_len": torch.as_tensor(ep_lengths, dtype=torch.float32),
+                }
+            }
         if self.ignore_terminations:
             infos["episode"]["terminated_at_end"] = torch.as_tensor(
                 terminations.copy(), dtype=torch.bool

@@ -116,11 +116,15 @@ class MultiStepRolloutWorker(Worker):
             )
         self.collect_prev_infos = self.cfg.rollout.get("collect_prev_infos", True)
         self.version = 0
+        if self.algorithm_cfg.get("loss_type") == "embodied_ogpo":
+            self.ogpo_eval_sampling_mode = "ode"
         self.finished_episodes = None
 
         self.weight_syncer = None
         self._sync_weight_comm_options = None
-        if not self.only_eval:
+        if not self.only_eval or bool(
+            cfg.rollout.get("enable_weight_sync_in_eval", False)
+        ):
             weight_syncer_cfg = OmegaConf.select(cfg, "weight_syncer", default=None)
             assert weight_syncer_cfg is not None, (
                 "rollout.weight_syncer config must be provided"
@@ -452,6 +456,13 @@ class MultiStepRolloutWorker(Worker):
         self.batch_router[tag] = []
         return AsyncRouteWork(works, lambda _: None)
 
+    def set_ogpo_eval_sampling_mode(self, mode: str) -> None:
+        """Select the flow sampler used by subsequent OGPO evaluations."""
+        normalized = str(mode).lower()
+        if normalized not in {"ode", "sde"}:
+            raise ValueError(f"Unsupported OGPO evaluation mode: {mode!r}")
+        self.ogpo_eval_sampling_mode = normalized
+
     def update_dagger_beta(self):
         if self.expert_model is None or not self.enable_dagger:
             return
@@ -476,6 +487,14 @@ class MultiStepRolloutWorker(Worker):
             if mode == "train"
             else self._eval_sampling_params
         )
+        if (
+            SupportedModel(self.model_cfg.model_type) == SupportedModel.FLOW_POLICY
+            and self.algorithm_cfg.get("loss_type") == "embodied_ogpo"
+        ):
+            kwargs = dict(kwargs)
+            kwargs["sampling_mode"] = (
+                "sde" if mode == "train" else self.ogpo_eval_sampling_mode
+            )
 
         if SupportedModel(self.model_cfg.model_type) in [
             SupportedModel.OPENPI,

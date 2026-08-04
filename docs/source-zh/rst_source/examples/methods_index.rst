@@ -127,6 +127,7 @@
    :maxdepth: 2
 
    SAC-Flow <embodied/sac_flow>
+   OGPO (D4RL) <embodied/ogpo_d4rl>
    DSRL <embodied/dsrl>
    RTC <embodied/rtc>
    DAgger <embodied/dagger>

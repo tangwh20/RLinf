@@ -1,0 +1,252 @@
+defaults:
+  - env/d4rl@env.train
+  - env/d4rl@env.eval
+  - model/mlp_policy@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: ${oc.env:OGPO_GPU_PLACEMENT,0}
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "d4rl_ogpo_relocate"
+    logger_backends: ["tensorboard"]
+  # 500 BC runner steps is a hard cap. Official-style SDE-success early stop
+  # normally shortens it; 3,907 later vector steps produce about 500k transitions.
+  max_epochs: 4407
+  max_steps: 4407
+  only_eval: false
+  # Set this to a global_step_N directory to resume or evaluate a checkpoint.
+  resume_dir: null
+  # Keeps eval workers enabled; OGPOEmbodiedRunner applies phase-relative
+  # official intervals below rather than this generic runner interval.
+  val_check_interval: 10
+  save_interval: -1
+  weight_sync_interval: 1
+  use_training_pipeline: false
+
+algorithm:
+  loss_type: embodied_ogpo
+  adv_type: embodied_sac
+  normalize_advantages: false
+  loss_agg_func: token-mean
+  kl_penalty: kl
+
+  # Adroit Relocate parameters adapted to RLinf's vectorized execution model.
+  group_size: 32
+  ppo_batch_size: 256
+  clip_epsilon: 0.01
+  normalize_group: false
+  normalize_action_logprob: true
+  normalize_denoising_logprob: true
+  adv_strategy: conservative
+  actor_agg_q: mean
+  agg_q: mean
+  bc_coeff: 1.0
+  bc_runner_steps: 500
+  bc_updates_per_step: 100
+  online_actor_lr: 4.5e-5
+  # Official adroit.sh clips BC once SDE success reaches 0.45, with 50k as
+  # the hard upper bound. The runner then executes exactly 500k online steps.
+  ogpo_bc_early_stop: true
+  ogpo_bc_early_stop_mode: sde
+  ogpo_bc_early_stop_metric: success
+  ogpo_bc_early_stop_threshold: 0.45
+  ogpo_online_env_steps: 500000
+  # Exact intervals from scripts/ogpo/adroit.sh.
+  ogpo_eval_interval_bc_updates: 1000
+  ogpo_eval_interval_env_steps: 20000
+  ogpo_log_interval_bc_updates: 5000
+  ogpo_log_interval_env_steps: 5000
+  # Save every 100k online transitions and once at the BC-to-online transition.
+  ogpo_save_interval_env_steps: 100000
+
+  gamma: 0.95
+  tau: 0.05
+  actor_tau: 0.05
+  # 32 envs x 4 primitive steps x official critic UTD 4.
+  update_epoch: 512
+  # Report the final update in each 512-update UTD block. Computing dozens of
+  # .item() statistics for every update serializes the CUDA stream.
+  # One actor update for every four critic updates (official utd_pi=1, utd_q=4).
+  critic_actor_ratio: 4
+  critic_subsample_size: -1
+  target_update_freq: 1
+  target_update_type: all
+  bootstrap_type: standard
+  backup_entropy: false
+  use_action_chunk_n_step_target: true
+  use_target_actor_for_bootstrap: true
+  success_buffer_batch_size: 256
+  success_buffer_utd: 4
+  # Official OGPO starts updates after 10k primitive environment transitions.
+  start_training_env_steps: 10000
+  train_actor_steps: 1
+
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: true
+    cache_size: 2000
+    sample_window_size: 62500
+    # OGPO gates on primitive env steps; this only requires one completed episode batch.
+    min_buffer_size: 1
+    auto_save: false
+
+data:
+  dataset_type: d4rl
+  task_name: relocate-expert-v1
+  dataset_path: null
+  shuffle: true
+  seed: 1
+  num_workers: 0
+  pin_memory: true
+
+env:
+  group_name: EnvGroup
+  train:
+    task_name: ${data.task_name}
+    rollout_epoch: 1
+    total_num_envs: 32
+    group_size: 1
+    # RLinf expresses this in primitive environment steps. One OGPO action
+    # chunk contains four primitive actions, so the minimum valid value is 4.
+    max_steps_per_rollout_epoch: 4
+    max_episode_steps: 200
+    auto_reset: true
+    ignore_terminations: false
+    episode_metric_schema: ogpo
+    # Old Gym reset(seed=...) kills a SubprocVectorEnv child.
+    use_seeded_reset: false
+    use_subproc_vector_env: true
+    is_eval: false
+  eval:
+    task_name: ${data.task_name}
+    rollout_epoch: 2
+    total_num_envs: 32
+    group_size: 1
+    max_steps_per_rollout_epoch: 200
+    max_episode_steps: 200
+    auto_reset: true
+    ignore_terminations: false
+    episode_metric_schema: ogpo
+    # Old Gym reset(seed=...) kills a SubprocVectorEnv child.
+    use_seeded_reset: false
+    use_subproc_vector_env: true
+    use_ordered_reset_state_ids: true
+    is_eval: true
+    video_cfg:
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: false
+  # OGPO evaluates the restored current actor (ODE) and target actor (SDE),
+  # so only-eval still needs actor-to-rollout weight synchronization.
+  enable_weight_sync_in_eval: true
+  # only_eval builds the rollout policy directly from this section.
+  model: ${actor.model}
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  # Native/multi-rank FSDP keeps the conservative per-rank micro-batch.
+  micro_batch_size: 128
+  global_batch_size: 256
+  seed: 1
+  enable_offload: false
+  compile_model: true
+  allow_tf32: true
+  # OGPO-local; other rank/strategy/offload combinations keep the native FSDP path.
+  ogpo_single_gpu_fast_path: true
+  # The plain single-GPU model fits the official batch without accumulation.
+  ogpo_single_gpu_micro_batch_size: 256
+
+  model:
+    model_type: flow_policy
+    input_type: state
+    policy_setup: panda-qpos
+    obs_dim: 39
+    action_dim: 30
+    num_action_chunks: 4
+    hidden_dim: 256
+    precision: "32"
+    add_value_head: false
+    add_q_head: true
+    num_q_heads: 10
+    denoising_steps: 3
+    # Official Adroit state-policy architecture.
+    actor_hidden_dims: [512, 512, 512, 512]
+    critic_hidden_dims: [512, 512, 512, 512]
+    time_embedding_dim: 32
+    use_batch_norm: false
+    flow_actor_type: OGPOFlowMLPActor
+    noise_std_head: false
+    noise_std_train: 0.05
+    noise_std_rollout: 0.05
+    use_tapered_noise: true
+    error_correct_sde_to_ode: true
+    randn_clip_value: 3.0
+    clip_intermediate_actions: true
+    best_of_n: 8
+    subsample_bon: true
+    is_lora: false
+    gradient_checkpointing: false
+    sharding_strategy: no_shard
+    vh_mode: q_network
+    q_network_separate_processing: true
+
+  optim:
+    clip_grad: 1000.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+    weight_decay: 0.0
+
+  critic_optim:
+    clip_grad: 1000.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+    weight_decay: 1.0e-5
+
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    # OGPO uses separate actor and q_head optimizers selected by parameter
+    # name. Keep original parameters visible after FSDP wrapping.
+    use_orig_params: true
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

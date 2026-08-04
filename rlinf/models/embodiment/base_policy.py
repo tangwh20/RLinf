@@ -26,6 +26,9 @@ class ForwardType(Enum):
     IQL_ACTOR = "iql_actor"
     IQL_CRITIC = "iql_critic"
     IQL_VALUE = "iql_value"
+    OGPO_BC = "ogpo_bc"
+    OGPO_SAMPLE = "ogpo_sample"
+    OGPO_LOGPROB = "ogpo_logprob"
     NFT = "nft"
 
 

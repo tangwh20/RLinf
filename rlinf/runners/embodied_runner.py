@@ -328,6 +328,15 @@ class EmbodiedRunner:
 
         return eval_metrics
 
+    def _should_log_step(self, step: int) -> bool:
+        """Whether scalar metrics and the console table should be emitted."""
+        del step
+        return True
+
+    def _metric_step(self, step: int) -> int:
+        """Return the TensorBoard x-axis step for this runner."""
+        return step
+
     def _log_step_metrics(
         self,
         step: int,
@@ -390,50 +399,57 @@ class EmbodiedRunner:
             for k, v in self._aggregate_numeric_metrics(actor_training_metrics).items()
         }
 
-        self.metric_logger.log(env_metrics, step)
-        self.metric_logger.log(rollout_metrics, step)
-        self.metric_logger.log(time_metrics, step)
-        self.metric_logger.log(training_metrics, step)
+        # Handles and timers above must be consumed every step, but expensive
+        # scalar serialization/table rendering can be safely rate limited by a
+        # specialized runner.
+        if not self._should_log_step(step):
+            return
+
+        metric_step = self._metric_step(step)
+        self.metric_logger.log(env_metrics, metric_step)
+        self.metric_logger.log(rollout_metrics, metric_step)
+        self.metric_logger.log(time_metrics, metric_step)
+        self.metric_logger.log(training_metrics, metric_step)
         self._log_ranked_metrics(
             metrics_list=actor_rollout_metrics,
-            step=step,
+            step=metric_step,
             prefix="rollout",
             worker_group_name=self.actor.worker_group_name,
         )
         self._log_ranked_metrics(
             metrics_list=actor_training_metrics,
-            step=step,
+            step=metric_step,
             prefix="train",
             worker_group_name=self.actor.worker_group_name,
         )
         self._log_ranked_metrics(
             metrics_list=actor_time_metrics_per_rank,
-            step=step,
+            step=metric_step,
             prefix="time/actor",
             worker_group_name=self.actor.worker_group_name,
         )
         self._log_ranked_metrics(
             metrics_list=rollout_time_metrics_per_rank,
-            step=step,
+            step=metric_step,
             prefix="time/rollout",
             worker_group_name=self.rollout.worker_group_name,
         )
         self._log_ranked_metrics(
             metrics_list=env_time_metrics_per_rank,
-            step=step,
+            step=metric_step,
             prefix="time/env",
             worker_group_name=self.env.worker_group_name,
         )
         self._log_ranked_metrics(
             metrics_list=env_metrics_per_rank,
-            step=step,
+            step=metric_step,
             prefix="env",
             worker_group_name=self.env.worker_group_name,
         )
         if self.reward is not None:
             self._log_ranked_metrics(
                 metrics_list=reward_time_metrics_per_rank,
-                step=step,
+                step=metric_step,
                 prefix="time/reward",
                 worker_group_name=self.reward.worker_group_name,
             )
@@ -559,6 +575,13 @@ class EmbodiedRunner:
                 actor_training_metrics=actor_training_metrics,
                 eval_metrics=eval_metrics,
             )
+
+            # Specialized runners may reduce max_steps at runtime (for
+            # example after an early-stopped pretraining phase).  The range
+            # endpoint was materialized before the loop, so honor the updated
+            # boundary explicitly.
+            if self.global_step >= self.max_steps:
+                break
 
         self._finish_run()
 

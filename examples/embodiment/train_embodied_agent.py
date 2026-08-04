@@ -48,7 +48,17 @@ def main(cfg) -> None:
     actor_placement = component_placement.get_strategy("actor")
     use_training_pipeline = bool(cfg.runner.get("use_training_pipeline", False))
 
-    if cfg.algorithm.loss_type == "embodied_sac":
+    if cfg.algorithm.loss_type == "embodied_ogpo":
+        if use_training_pipeline:
+            raise ValueError(
+                "runner.use_training_pipeline=True is not supported for embodied_ogpo."
+            )
+        from rlinf.workers.actor.fsdp_ogpo_policy_worker import (
+            EmbodiedOGPOFSDPPolicy,
+        )
+
+        actor_worker_cls = EmbodiedOGPOFSDPPolicy
+    elif cfg.algorithm.loss_type == "embodied_sac":
         if use_training_pipeline:
             raise ValueError(
                 "runner.use_training_pipeline=True is not supported for embodied_sac."
@@ -152,7 +162,13 @@ def main(cfg) -> None:
             placement_strategy=reward_placement,
         )
 
-    runner = EmbodiedRunner(
+    runner_cls = EmbodiedRunner
+    if cfg.algorithm.loss_type == "embodied_ogpo":
+        from rlinf.runners.ogpo_embodied_runner import OGPOEmbodiedRunner
+
+        runner_cls = OGPOEmbodiedRunner
+
+    runner = runner_cls(
         cfg=cfg,
         actor=actor_group,
         rollout=rollout_group,

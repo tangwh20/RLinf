@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -53,6 +53,9 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+if TYPE_CHECKING:
+    from rlinf.data.ogpo_io_struct import OGPOEmbodiedRolloutResult
 
 
 class EnvWorker(Worker):
@@ -207,6 +210,16 @@ class EnvWorker(Worker):
                     action_dim=self.model_cfg.action_dim,
                 )
                 for _ in range(self.stage_num)
+            ]
+        if self.cfg.algorithm.get("loss_type") == "embodied_ogpo":
+            from rlinf.data.ogpo_io_struct import OGPOEmbodiedRolloutResult
+
+            return [
+                OGPOEmbodiedRolloutResult(
+                    max_episode_length=max_episode_length,
+                    source_rank=self._rank * self.stage_num + stage_id,
+                )
+                for stage_id in range(self.stage_num)
             ]
         return [
             EmbodiedRolloutResult(max_episode_length=max_episode_length)
@@ -522,6 +535,42 @@ class EnvWorker(Worker):
             "infos_list": infos_list,
         }
         return env_output, env_info, chunk_step_payload
+
+    def _append_ogpo_primitive_transitions(
+        self,
+        rollout_result: "OGPOEmbodiedRolloutResult",
+        curr_obs: dict[str, torch.Tensor],
+        env_output: EnvOutput,
+        chunk_step_payload: dict[str, Any],
+    ) -> None:
+        """Preserve primitive transitions for official sliding-window replay."""
+        from rlinf.data.ogpo_io_struct import _extract_chunk_successes
+
+        obs_list = chunk_step_payload["obs_list"]
+        post_states = torch.stack([obs["states"] for obs in obs_list], dim=1)
+        curr_states = torch.cat(
+            [curr_obs["states"].unsqueeze(1), post_states[:, :-1]], dim=1
+        )
+        next_states = post_states.clone()
+        last_info = chunk_step_payload["infos_list"][-1]
+        done_mask = env_output.dones[:, -1]
+        final_observation = last_info.get("final_observation")
+        if done_mask.any() and isinstance(final_observation, dict):
+            next_states[done_mask, -1] = final_observation["states"][done_mask]
+        actions = chunk_step_payload["chunk_actions"]
+        if isinstance(actions, dict):
+            actions = actions["actions"]
+        rollout_result.append_primitive_transitions(
+            curr_states=curr_states,
+            next_states=next_states,
+            actions=actions,
+            rewards=env_output.rewards,
+            successes=_extract_chunk_successes(
+                chunk_step_payload["infos_list"], env_output.rewards.shape[0]
+            ),
+            terminations=env_output.terminations,
+            truncations=env_output.truncations,
+        )
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -1117,6 +1166,10 @@ class EnvWorker(Worker):
                         rollout_result.actions, stage_id
                     )
                     stage_rollout = self.rollout_results[stage_id]
+                    if self.cfg.algorithm.get("loss_type") == "embodied_ogpo":
+                        self._append_ogpo_primitive_transitions(
+                            stage_rollout, curr_obs, env_output, chunk_step_payload
+                        )
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
                         stage_rollout.append_chunk_episode_data(
                             rollout_result=rollout_result,
