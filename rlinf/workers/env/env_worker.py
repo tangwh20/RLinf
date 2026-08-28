@@ -1411,6 +1411,16 @@ class EnvWorker(Worker):
 
         return eval_metrics
 
+    def reset_ogpo_eval_state_sequence(self) -> None:
+        """Reset deterministic evaluation state IDs before ODE or SDE."""
+        for env in self.eval_env_list:
+            reset_sequence = get_env_attr(env, "reset_eval_state_sequence")
+            if not callable(reset_sequence):
+                raise RuntimeError(
+                    "Evaluation environment cannot replay its reset sequence."
+                )
+            reset_sequence()
+
     def get_actor_split_num(self):
         send_num = self._component_placement.get_world_size("env") * self.stage_num
         recv_num = self._component_placement.get_world_size("actor")

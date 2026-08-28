@@ -586,6 +586,27 @@ def get_lr_scheduler(
             return min_mult + (1.0 - min_mult) * cosine
 
         return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
+    elif lr_scheduler == "ogpo_repeating_warmup_cosine":
+        # Match OGPO_public's create_lr_schedule: warm up from min_lr to the
+        # optimizer base LR, cosine-decay to min_lr, then repeat every
+        # num_training_steps updates.
+        from torch.optim.lr_scheduler import LambdaLR
+
+        base_lr = optimizer.param_groups[0]["lr"]
+        min_mult = min_lr / base_lr if base_lr > 0 else 0.0
+
+        def lr_lambda(current_step):
+            step = current_step % max(1, num_training_steps)
+            if step < num_warmup_steps:
+                progress = step / max(1, num_warmup_steps)
+                return min_mult + (1.0 - min_mult) * progress
+            progress = (step - num_warmup_steps) / max(
+                1, num_training_steps - num_warmup_steps
+            )
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_mult + (1.0 - min_mult) * cosine
+
+        return LambdaLR(optimizer, lr_lambda, last_epoch=last_epoch)
     # PyTorch native
     elif lr_scheduler == "torch_constant":
         from torch.optim.lr_scheduler import ConstantLR

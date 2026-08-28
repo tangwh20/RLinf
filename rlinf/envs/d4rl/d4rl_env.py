@@ -16,7 +16,6 @@ import copy
 import time
 from typing import Any, Optional, Union
 
-import d4rl  # noqa: F401  # registers D4RL envs with gym
 import gym
 import numpy as np
 import torch
@@ -126,13 +125,7 @@ class D4RLEnv(gym.Env):
         _task_name = self.task_name
 
         def _make_env() -> gym.Env:
-            if _render_mode is not None:
-                try:
-                    return gym.make(_task_name, render_mode=_render_mode)
-                except TypeError:
-                    # Older gym may not accept render_mode in make().
-                    return gym.make(_task_name)
-            return gym.make(_task_name)
+            return self._make_single_env(_task_name, _render_mode, cfg)
 
         env_fns = [_make_env for _ in range(self.num_envs)]
         if self.use_subproc_vector_env:
@@ -159,6 +152,20 @@ class D4RLEnv(gym.Env):
         self._elapsed_steps = np.zeros((self.num_envs,), dtype=np.int32)
         self.prev_step_reward = np.zeros((self.num_envs,), dtype=np.float32)
         self._init_reset_state_ids()
+
+    @staticmethod
+    def _make_single_env(task_name: str, render_mode: str | None, cfg: Any) -> gym.Env:
+        """Create one underlying environment instance."""
+        import d4rl  # noqa: F401  # registers D4RL envs with gym
+
+        del cfg
+        if render_mode is not None:
+            try:
+                return gym.make(task_name, render_mode=render_mode)
+            except TypeError:
+                # Older gym may not accept render_mode in make().
+                return gym.make(task_name)
+        return gym.make(task_name)
 
     @staticmethod
     def _build_score_env(task_name: str) -> gym.Env | None:
@@ -257,6 +264,15 @@ class D4RLEnv(gym.Env):
         self.reset_state_ids = np.repeat(reset_state_ids, self.group_size)[
             : self.num_envs
         ]
+
+    def reset_eval_state_sequence(self) -> None:
+        """Replay the same ordered, seeded resets for each evaluation mode."""
+        if not self.is_eval:
+            raise RuntimeError("reset_eval_state_sequence is eval-only")
+        self.start_idx = 0
+        # Match initialization, which consumes the first ordered ID before the
+        # first environment reset. ODE and SDE will therefore start identically.
+        self.update_reset_state_ids()
 
     @staticmethod
     def _wrap_obs(obs: np.ndarray | torch.Tensor) -> dict[str, torch.Tensor]:

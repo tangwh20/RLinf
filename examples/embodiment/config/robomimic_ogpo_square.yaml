@@ -1,0 +1,264 @@
+defaults:
+  - env/robomimic@env.train
+  - env/robomimic@env.eval
+  - model/mlp_policy@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,env,rollout: ${oc.env:OGPO_GPU_PLACEMENT,0}
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf
+    experiment_name: "robomimic_ogpo_square"
+    logger_backends: ["tensorboard"]
+  # 500 x 1,000 gives OGPO_public's 500k BC-update hard cap. Afterward,
+  # 15,625 vector steps x 32 envs x 4 actions produce 2M transitions.
+  max_epochs: 16125
+  max_steps: 16125
+  only_eval: false
+  # Set this to a global_step_N directory to resume or evaluate a checkpoint.
+  resume_dir: null
+  # Keeps eval workers enabled; OGPOEmbodiedRunner applies phase-relative
+  # official intervals below rather than this generic runner interval.
+  val_check_interval: 10
+  save_interval: -1
+  weight_sync_interval: 1
+  use_training_pipeline: false
+  # Experimental OGPO-specific bounded async pipeline. It overlaps training
+  # on the previous replay batch with collection of exactly one next batch.
+  use_ogpo_async_pipeline: false
+  ogpo_async_max_policy_lag: 1
+
+algorithm:
+  loss_type: embodied_ogpo
+  adv_type: embodied_sac
+  normalize_advantages: false
+  loss_agg_func: token-mean
+  kl_penalty: kl
+
+  # OGPO_public scripts/ogpo/square.sh parameters.
+  group_size: 32
+  ppo_batch_size: 256
+  clip_epsilon: 0.01
+  normalize_group: false
+  normalize_action_logprob: true
+  normalize_denoising_logprob: true
+  adv_strategy: conservative
+  actor_agg_q: mean
+  agg_q: mean
+  bc_coeff: 1.0
+  bc_runner_steps: 500
+  bc_updates_per_step: 1000
+  online_actor_lr: 4.5e-5
+  online_actor_lr_scheduler: ref_warmup_cosine
+  online_actor_lr_warmup_steps: 2000
+  online_actor_total_training_steps: 50000
+  online_actor_min_lr: 2.0e-5
+  # Official adroit.sh clips BC once SDE success reaches 0.45, with 50k as
+  # the hard upper bound. The runner then executes exactly 500k online steps.
+  ogpo_bc_early_stop: true
+  ogpo_bc_early_stop_mode: sde
+  ogpo_bc_early_stop_metric: success
+  ogpo_bc_early_stop_threshold: 0.45
+  ogpo_online_env_steps: 2000000
+  # Exact intervals from scripts/ogpo/square.sh.
+  ogpo_eval_interval_bc_updates: 5000
+  ogpo_eval_interval_env_steps: 10000
+  ogpo_log_interval_bc_updates: 5000
+  ogpo_log_interval_env_steps: 5000
+  ogpo_save_interval_env_steps: 500000
+
+  gamma: 0.99
+  tau: 0.05
+  actor_tau: 0.005
+  # 32 envs x 4 primitive steps x OGPO_public online UTD 1.
+  update_epoch: 128
+  # Report the final update in each UTD block. Computing dozens of
+  # .item() statistics for every update serializes the CUDA stream.
+  # OGPO_public Square uses utd_pi=1 and utd_q=1.
+  critic_actor_ratio: 1
+  critic_subsample_size: -1
+  target_update_freq: 1
+  target_update_type: all
+  bootstrap_type: standard
+  backup_entropy: false
+  use_action_chunk_n_step_target: true
+  use_target_actor_for_bootstrap: true
+  success_buffer_batch_size: 256
+  success_buffer_utd: 1
+  # Official OGPO starts updates after 10k primitive environment transitions.
+  start_training_env_steps: 10000
+  train_actor_steps: 1
+
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+
+  replay_buffer:
+    enable_cache: true
+    cache_size: 2000
+    sample_window_size: 62500
+    # OGPO gates on primitive env steps; this only requires one completed episode batch.
+    min_buffer_size: 1
+    auto_save: false
+
+data:
+  dataset_type: robomimic
+  task_name: square-mh-low_dim
+  dataset_path: /mnt/public/datasets/ogpo_data/square/mh/low_dim_v15.hdf5
+  dataset_root: /mnt/public/datasets/ogpo_data
+  shuffle: true
+  seed: 1
+  num_workers: 0
+  pin_memory: true
+
+env:
+  group_name: EnvGroup
+  train:
+    task_name: ${data.task_name}
+    dataset_path: ${data.dataset_path}
+    dataset_root: ${data.dataset_root}
+    rollout_epoch: 1
+    total_num_envs: 32
+    group_size: 1
+    # RLinf expresses this in primitive environment steps. One OGPO action
+    # chunk contains four primitive actions, so the minimum valid value is 4.
+    max_steps_per_rollout_epoch: 4
+    max_episode_steps: 400
+    auto_reset: true
+    ignore_terminations: false
+    episode_metric_schema: ogpo
+    # Old Gym reset(seed=...) kills a SubprocVectorEnv child.
+    use_seeded_reset: false
+    use_subproc_vector_env: true
+    is_eval: false
+  eval:
+    task_name: ${data.task_name}
+    dataset_path: ${data.dataset_path}
+    dataset_root: ${data.dataset_root}
+    rollout_epoch: 2
+    total_num_envs: 32
+    group_size: 1
+    max_steps_per_rollout_epoch: 400
+    max_episode_steps: 400
+    auto_reset: true
+    ignore_terminations: false
+    episode_metric_schema: ogpo
+    # Old Gym reset(seed=...) kills a SubprocVectorEnv child.
+    use_seeded_reset: false
+    use_subproc_vector_env: true
+    use_ordered_reset_state_ids: true
+    is_eval: true
+    video_cfg:
+      save_video: false
+      video_base_dir: ${runner.logger.log_path}/video/eval
+
+rollout:
+  group_name: RolloutGroup
+  backend: huggingface
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: true
+  collect_prev_infos: false
+  # OGPO evaluates the restored current actor (ODE) and target actor (SDE),
+  # so only-eval still needs actor-to-rollout weight synchronization.
+  enable_weight_sync_in_eval: true
+  # only_eval builds the rollout policy directly from this section.
+  model: ${actor.model}
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  # Native/multi-rank FSDP keeps the conservative per-rank micro-batch.
+  micro_batch_size: 128
+  global_batch_size: 256
+  seed: 1
+  enable_offload: false
+  compile_model: true
+  allow_tf32: true
+  # OGPO-local; other rank/strategy/offload combinations keep the native FSDP path.
+  ogpo_single_gpu_fast_path: true
+  # The plain single-GPU model fits the official batch without accumulation.
+  ogpo_single_gpu_micro_batch_size: 256
+
+  model:
+    model_type: flow_policy
+    input_type: state
+    policy_setup: panda-qpos
+    obs_dim: 23
+    action_dim: 7
+    num_action_chunks: 4
+    hidden_dim: 256
+    precision: "32"
+    add_value_head: false
+    add_q_head: true
+    num_q_heads: 10
+    denoising_steps: 10
+    # Official Square state-policy architecture.
+    actor_hidden_dims: [512, 512, 512, 512]
+    critic_hidden_dims: [512, 512, 512, 512]
+    time_embedding_dim: 32
+    use_batch_norm: false
+    flow_actor_type: OGPOFlowMLPActor
+    noise_std_head: false
+    noise_std_train: 0.05
+    noise_std_rollout: 0.05
+    use_tapered_noise: true
+    error_correct_sde_to_ode: true
+    randn_clip_value: 3.0
+    clip_intermediate_actions: true
+    best_of_n: 8
+    subsample_bon: true
+    is_lora: false
+    gradient_checkpointing: false
+    sharding_strategy: no_shard
+    vh_mode: q_network
+    q_network_separate_processing: true
+
+  optim:
+    clip_grad: 1000.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+    weight_decay: 0.0
+
+  critic_optim:
+    clip_grad: 1000.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+    weight_decay: 1.0e-5
+
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    # OGPO uses separate actor and q_head optimizers selected by parameter
+    # name. Keep original parameters visible after FSDP wrapping.
+    use_orig_params: true
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false

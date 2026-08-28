@@ -433,9 +433,14 @@ class FlowStateConfig:
     actor_hidden_dims: tuple[int, ...] = (512, 512, 512, 512)
     critic_hidden_dims: tuple[int, ...] = (512, 512, 512, 512)
     time_embedding_dim: int = 32
+    two_tier_image_dim: int = 0
+    two_tier_proprio_dim: int = 0
+    two_tier_fused_dim: int = 0
+    critic_obs_dim: int = 0
     # OGPO Adroit uses Q-filtered best-of-N for SDE rollout/evaluation.
     best_of_n: int = 1
     subsample_bon: bool = False
+    pretrained_actor_path: str | None = None
 
     def update_from_dict(self, config_dict):
         for key, value in config_dict.items():
@@ -549,6 +554,9 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 error_correct_sde_to_ode=self.cfg.error_correct_sde_to_ode,
                 randn_clip_value=self.cfg.randn_clip_value,
                 clip_intermediate_actions=self.cfg.clip_intermediate_actions,
+                two_tier_image_dim=self.cfg.two_tier_image_dim,
+                two_tier_proprio_dim=self.cfg.two_tier_proprio_dim,
+                two_tier_fused_dim=self.cfg.two_tier_fused_dim,
             )
         else:
             raise ValueError(f"Unknown flow_actor_type: {self.cfg.flow_actor_type}")
@@ -563,11 +571,21 @@ class FlowStatePolicy(nn.Module, BasePolicy):
             if self.use_official_ogpo_arch:
                 from rlinf.models.embodiment.modules.ogpo import OGPOMultiQHead
 
+                critic_obs_dim = self.cfg.critic_obs_dim or self.cfg.obs_dim
                 self.q_head = OGPOMultiQHead(
-                    obs_dim=self.cfg.obs_dim,
+                    obs_dim=critic_obs_dim,
                     action_dim=self.full_action_dim,
                     hidden_dims=tuple(self.cfg.critic_hidden_dims),
                     num_q_heads=self.cfg.num_q_heads,
+                    two_tier_image_dim=(
+                        0 if self.cfg.critic_obs_dim else self.cfg.two_tier_image_dim
+                    ),
+                    two_tier_proprio_dim=(
+                        0 if self.cfg.critic_obs_dim else self.cfg.two_tier_proprio_dim
+                    ),
+                    two_tier_fused_dim=(
+                        0 if self.cfg.critic_obs_dim else self.cfg.two_tier_fused_dim
+                    ),
                 )
             else:
                 self.q_head = MultiQHead(
@@ -576,6 +594,13 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                     num_q_heads=self.cfg.num_q_heads,
                     action_feature_dim=self.cfg.action_dim,
                 )
+
+        if self.cfg.pretrained_actor_path:
+            converted = torch.load(
+                self.cfg.pretrained_actor_path, map_location="cpu", weights_only=False
+            )
+            actor_state = converted.get("actor", converted)
+            self.flow_actor.load_state_dict(actor_state, strict=True)
 
         if self.cfg.action_scale is not None:
             l, h = self.cfg.action_scale
@@ -597,9 +622,25 @@ class FlowStatePolicy(nn.Module, BasePolicy):
         device = next(self.parameters()).device
         return {"states": env_obs["states"].to(device)}
 
+    def _actor_states(self, obs):
+        """Return the pixel actor input, excluding trailing privileged state."""
+        return obs["states"][..., : self.cfg.obs_dim]
+
+    def _critic_states(self, obs):
+        """Return privileged state for Q, or the shared observation by default."""
+        if not self.cfg.critic_obs_dim:
+            return obs["states"]
+        if obs["states"].shape[-1] < self.cfg.obs_dim + self.cfg.critic_obs_dim:
+            raise ValueError(
+                "Privileged-state critic requires online observations with "
+                f"{self.cfg.obs_dim + self.cfg.critic_obs_dim} features; got "
+                f"{obs['states'].shape[-1]}"
+            )
+        return obs["states"][..., -self.cfg.critic_obs_dim :]
+
     def sac_forward(self, obs, **kwargs):
         """SAC forward pass using Flow Matching actor"""
-        feat = self.backbone(obs["states"])
+        feat = self.backbone(self._actor_states(obs))
 
         # Use flow actor to generate actions
         # FlowTActor expects obs as input, we pass mix_feature as the observation
@@ -612,15 +653,15 @@ class FlowStatePolicy(nn.Module, BasePolicy):
 
     def get_q_values(self, obs, actions, shared_feature=None, detach_encoder=False):
         """Get Q-values for given observations and actions"""
-        return self.q_head(obs["states"], actions)
+        return self.q_head(self._critic_states(obs), actions)
 
     # use get_q_values() as sac_q_forward()
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
-        return self.q_head(obs["states"], actions)
+        return self.q_head(self._critic_states(obs), actions)
 
     def ogpo_bc_forward(self, obs, actions):
         """Return predicted and target velocities for OGPO flow BC."""
-        feat = self.backbone(obs["states"])
+        feat = self.backbone(self._actor_states(obs))
         noise = torch.randn_like(actions)
         timesteps = torch.rand(
             (actions.shape[0], 1), device=actions.device, dtype=actions.dtype
@@ -634,12 +675,12 @@ class FlowStatePolicy(nn.Module, BasePolicy):
 
     def ogpo_sample_forward(self, obs):
         """Sample an OGPO SDE chain from this policy."""
-        feat = self.backbone(obs["states"])
+        feat = self.backbone(self._actor_states(obs))
         return self.flow_actor.sample_chain(feat, train=True)
 
     def ogpo_logprob_forward(self, obs, chain):
         """Evaluate a fixed OGPO SDE chain under this policy."""
-        feat = self.backbone(obs["states"])
+        feat = self.backbone(self._actor_states(obs))
         return self.flow_actor.evaluate_chain_log_prob(feat, chain, train=True)
 
     # 10. add unified forward()
@@ -703,7 +744,7 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 raise ValueError(f"Unsupported flow sampling mode: {sampling_mode!r}")
 
         env_obs = self.preprocess_env_obs(env_obs)
-        feat = self.backbone(env_obs["states"])
+        feat = self.backbone(self._actor_states(env_obs))
 
         if not self.use_official_ogpo_arch:
             action, log_prob = self.flow_actor(feat, train=False, log_grad=False)
@@ -719,7 +760,9 @@ class FlowStatePolicy(nn.Module, BasePolicy):
                 candidates, _, candidate_log_prob = self.flow_actor.sample_chain(
                     repeated_feat, train=False
                 )
-                repeated_states = env_obs["states"].repeat_interleave(best_of_n, dim=0)
+                repeated_states = self._critic_states(env_obs).repeat_interleave(
+                    best_of_n, dim=0
+                )
                 q_values = self.q_head(repeated_states, candidates).reshape(
                     batch_size, best_of_n, -1
                 )
