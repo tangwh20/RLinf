@@ -24,12 +24,14 @@ from __future__ import annotations
 import math
 import os
 from collections import deque
+from contextlib import nullcontext
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
@@ -89,6 +91,23 @@ def _get_ogpo_online_micro_batch_size(cfg: DictConfig, world_size: int) -> int:
     return micro_batch_size
 
 
+def _get_pretrained_target_actor_state(converted: dict) -> dict | None:
+    """Prefer a saved EMA actor and fall back to an actor-only BC checkpoint."""
+    target_actor = converted.get("target_actor")
+    if target_actor is not None:
+        return target_actor
+    return converted.get("actor")
+
+
+def _repeat_batch(value: Any, repeats: int) -> Any:
+    """Repeat a nested observation batch contiguously for batched QVR."""
+    if torch.is_tensor(value):
+        return value.repeat_interleave(repeats, dim=0)
+    if isinstance(value, dict):
+        return {key: _repeat_batch(item, repeats) for key, item in value.items()}
+    raise TypeError(f"Unsupported batched QVR observation type: {type(value)!r}")
+
+
 def compute_discounted_chunk_return(
     rewards: torch.Tensor, gamma: float, horizon: int
 ) -> torch.Tensor:
@@ -107,9 +126,13 @@ class _ActionChunkDataset(Dataset):
         self.dataset = dataset
         self.horizon = horizon
         self.dones = torch.as_tensor(dataset.dones_float, dtype=torch.bool)
-        self.valid_starts = torch.arange(
-            max(0, len(dataset) - horizon + 1), dtype=torch.long
-        )
+        explicit_starts = getattr(dataset, "action_chunk_start_indices", None)
+        if explicit_starts is None:
+            self.valid_starts = torch.arange(
+                max(0, len(dataset) - horizon + 1), dtype=torch.long
+            )
+        else:
+            self.valid_starts = torch.as_tensor(explicit_starts, dtype=torch.long)
 
     def __len__(self) -> int:
         return int(self.valid_starts.numel())
@@ -201,6 +224,7 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         self._using_success_bc = False
         self._ogpo_rollout_weight_source = "target"
+        self._ogpo_profile_traces = 0
 
     def init_worker(self) -> None:
         """Initialize OGPO and enable its optional single-GPU TF32 policy."""
@@ -222,6 +246,43 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                 "FSDP NO_SHARD."
             )
         super().init_worker()
+        if bool(self.cfg.algorithm.get("q_vr_batched", False)):
+            qvr_batch = int(self.cfg.actor.global_batch_size) * int(
+                self.cfg.algorithm.get("q_vr_num_samples", 8)
+            )
+            self.model.q_head.vectorized_batch_limit = max(
+                self.model.q_head.vectorized_batch_limit, qvr_batch
+            )
+            self.target_model.q_head.vectorized_batch_limit = max(
+                self.target_model.q_head.vectorized_batch_limit, qvr_batch
+            )
+        if bool(self.cfg.actor.get("ogpo_compile_critic", False)):
+            compile_mode = str(
+                self.cfg.actor.get("ogpo_compile_critic_mode", "default")
+            )
+            # nn.Module.compile() changes __call__ in place, so optimizer
+            # parameters and checkpoint state-dict keys remain unchanged.
+            self.model.q_head.compile(mode=compile_mode)
+            self.target_model.q_head.compile(mode=compile_mode)
+            self.log_info(f"Compiled OGPO online and target critic ({compile_mode=}).")
+        converted_path = self.cfg.actor.model.get("pretrained_actor_path")
+        if converted_path:
+            converted = torch.load(
+                converted_path, map_location="cpu", weights_only=False
+            )
+            target_actor = _get_pretrained_target_actor_state(converted)
+            if target_actor is not None:
+                target_state = self._strategy.get_model_state_dict(
+                    self.target_model, cpu_offload=True, full_state_dict=True
+                )
+                for name, value in target_actor.items():
+                    target_state[f"flow_actor.{name}"] = value
+                self._strategy.load_model_with_state_dict(
+                    self.target_model,
+                    target_state,
+                    cpu_offload=True,
+                    full_state_dict=True,
+                )
 
     def set_ogpo_rollout_weight_source(self, source: str) -> None:
         """Select current weights for ODE or EMA target weights for SDE."""
@@ -273,9 +334,26 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
     def setup_sac_components(self) -> None:
         """Initialize online replay and the offline expert dataloader."""
         super().setup_sac_components()
-        from rlinf.data.datasets.d4rl import build_d4rl_dataset_from_cfg
+        if bool(self.cfg.runner.get("only_eval", False)):
+            self.log_info("OGPO evaluation-only run: skipping the offline dataset.")
+            return
+        dataset_type = str(self.cfg.data.get("dataset_type", "d4rl")).lower()
+        if dataset_type == "realworld_franka_paligemma":
+            from rlinf.data.datasets.realworld_franka_paligemma import (
+                build_realworld_franka_paligemma_dataset_from_cfg,
+            )
 
-        dataset = build_d4rl_dataset_from_cfg(self.cfg)
+            dataset = build_realworld_franka_paligemma_dataset_from_cfg(self.cfg)
+        elif dataset_type == "robomimic":
+            from rlinf.data.datasets.robomimic import (
+                build_robomimic_dataset_from_cfg,
+            )
+
+            dataset = build_robomimic_dataset_from_cfg(self.cfg)
+        else:
+            from rlinf.data.datasets.d4rl import build_d4rl_dataset_from_cfg
+
+            dataset = build_d4rl_dataset_from_cfg(self.cfg)
         horizon = int(self.cfg.actor.model.get("num_action_chunks", 1))
         dataset = _ActionChunkDataset(dataset, horizon=horizon)
         batch_size = int(self.cfg.actor.global_batch_size) // self._world_size
@@ -425,7 +503,13 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                                 self._success_bc_samples.append(
                                     {
                                         "observations": sample["curr_state"].clone(),
+                                        "next_observations": sample[
+                                            "next_state"
+                                        ].clone(),
                                         "actions": sample["actions"].clone(),
+                                        "rewards": sample["rewards"].clone(),
+                                        "terminations": sample["terminations"].clone(),
+                                        "truncations": sample["truncations"].clone(),
                                         "valid": sample["valid"].clone(),
                                     }
                                 )
@@ -517,6 +601,28 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             "valid": valid,
         }
 
+    def _online_success_q_batch(self, batch_size: int) -> dict[str, Any] | None:
+        """Sample an official-format TD batch from successful trajectories."""
+        if len(self._success_bc_samples) < self._success_buffer_min_samples():
+            return None
+        indices = torch.randint(len(self._success_bc_samples), (batch_size,))
+        samples = [self._success_bc_samples[int(index)] for index in indices]
+
+        def stack(name: str) -> torch.Tensor:
+            return torch.stack([sample[name] for sample in samples]).to(
+                self.device, non_blocking=True
+            )
+
+        return {
+            "curr_obs": {"states": stack("observations")},
+            "next_obs": {"states": stack("next_observations")},
+            "actions": stack("actions"),
+            "rewards": stack("rewards"),
+            "terminations": stack("terminations"),
+            "truncations": stack("truncations"),
+            "valid": stack("valid"),
+        }
+
     def _next_offline_batch(self) -> dict[str, torch.Tensor]:
         assert self.offline_data_loader is not None
         try:
@@ -594,14 +700,40 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self._enter_online_phase()
 
     def _reset_online_optimizers(self) -> None:
-        """Mirror the official BC-to-online AdamW reset at PPO LR."""
-        online_lr = float(self.cfg.algorithm.get("online_actor_lr", 4.5e-5))
-        for optimizer in (self.optimizer, self.qf_optimizer):
-            optimizer.state.clear()
-            for group in optimizer.param_groups:
-                group["lr"] = online_lr
-                group["initial_lr"] = online_lr
-        self.build_lr_schedulers()
+        """Reset AdamW state while preserving official actor and critic LRs."""
+        actor_lr = float(self.cfg.algorithm.get("online_actor_lr", 4.5e-5))
+        critic_lr = float(self.cfg.actor.critic_optim.lr)
+        self.optimizer.state.clear()
+        for group in self.optimizer.param_groups:
+            group["lr"] = actor_lr
+            group["initial_lr"] = actor_lr
+        self.qf_optimizer.state.clear()
+        for group in self.qf_optimizer.param_groups:
+            group["lr"] = critic_lr
+            group["initial_lr"] = critic_lr
+        actor_optim_cfg = OmegaConf.create(
+            OmegaConf.to_container(self.cfg.actor.optim, resolve=True)
+        )
+        actor_optim_cfg.lr_scheduler = self.cfg.algorithm.get(
+            "online_actor_lr_scheduler", actor_optim_cfg.lr_scheduler
+        )
+        actor_optim_cfg.lr_warmup_steps = int(
+            self.cfg.algorithm.get("online_actor_lr_warmup_steps", 0)
+        )
+        actor_optim_cfg.total_training_steps = int(
+            self.cfg.algorithm.get("online_actor_total_training_steps", 0)
+        )
+        actor_optim_cfg.min_lr = float(
+            self.cfg.algorithm.get("online_actor_min_lr", 0.0)
+        )
+        self.lr_scheduler = self.build_lr_scheduler(self.optimizer, actor_optim_cfg)
+        self.qf_lr_scheduler = self.build_lr_scheduler(
+            self.qf_optimizer, self.cfg.actor.critic_optim
+        )
+        if self.alpha_optimizer is not None:
+            self.alpha_lr_scheduler = self.build_lr_scheduler(
+                self.alpha_optimizer, self.cfg.algorithm.entropy_tuning.optim
+            )
 
     def restore_ogpo_training_state(
         self, bc_update_steps: int, online_env_steps: int, bc_finished: bool
@@ -693,13 +825,76 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             next_state_log_pi = next_state_log_pi.sum(dim=-1, keepdim=True)
             if not use_crossq:
                 dsrl_kwargs = {"train": True} if use_dsrl else {}
-                all_qf_next_target = self.target_model(
-                    forward_type=ForwardType.SAC_Q,
-                    obs=next_obs,
-                    actions=next_state_actions,
-                    shared_feature=None,
-                    **dsrl_kwargs,
-                )
+                if bool(self.cfg.algorithm.get("q_variance_reduction", False)):
+                    num_samples = int(self.cfg.algorithm.get("q_vr_num_samples", 8))
+                    reduction = str(self.cfg.algorithm.get("q_vr_reduction", "mean"))
+                    if num_samples < 1:
+                        raise ValueError("q_vr_num_samples must be positive")
+                    if bool(self.cfg.algorithm.get("q_vr_batched", False)):
+                        batch_size = next_state_actions.shape[0]
+                        repeated_obs = _repeat_batch(next_obs, num_samples)
+                        action_shape = next_state_actions.shape[1:]
+                        if num_samples > 1:
+                            additional_obs = _repeat_batch(next_obs, num_samples - 1)
+                            additional_actions, _, _ = bootstrap_actor(
+                                forward_type=ForwardType.SAC,
+                                obs=additional_obs,
+                                **kwargs,
+                            )
+                            sampled_actions = torch.cat(
+                                (
+                                    next_state_actions.unsqueeze(1),
+                                    additional_actions.reshape(
+                                        batch_size, num_samples - 1, *action_shape
+                                    ),
+                                ),
+                                dim=1,
+                            ).reshape(batch_size * num_samples, *action_shape)
+                        else:
+                            sampled_actions = next_state_actions
+                        sampled_q_values = self.target_model(
+                            forward_type=ForwardType.SAC_Q,
+                            obs=repeated_obs,
+                            actions=sampled_actions,
+                            shared_feature=None,
+                            **dsrl_kwargs,
+                        ).reshape(batch_size, num_samples, -1)
+                        sampled_q_values = sampled_q_values.transpose(0, 1)
+                    else:
+                        all_qf_next_target = self.target_model(
+                            forward_type=ForwardType.SAC_Q,
+                            obs=next_obs,
+                            actions=next_state_actions,
+                            shared_feature=None,
+                            **dsrl_kwargs,
+                        )
+                        sampled_q_values = [all_qf_next_target]
+                        for _ in range(num_samples - 1):
+                            sampled_actions, _, _ = bootstrap_actor(
+                                forward_type=ForwardType.SAC, obs=next_obs, **kwargs
+                            )
+                            sampled_q_values.append(
+                                self.target_model(
+                                    forward_type=ForwardType.SAC_Q,
+                                    obs=next_obs,
+                                    actions=sampled_actions,
+                                    shared_feature=None,
+                                    **dsrl_kwargs,
+                                )
+                            )
+                        sampled_q_values = torch.stack(sampled_q_values, dim=0)
+                    if reduction == "mean":
+                        all_qf_next_target = sampled_q_values.mean(dim=0)
+                    else:
+                        raise ValueError(f"Unsupported q_vr_reduction: {reduction!r}")
+                else:
+                    all_qf_next_target = self.target_model(
+                        forward_type=ForwardType.SAC_Q,
+                        obs=next_obs,
+                        actions=next_state_actions,
+                        shared_feature=None,
+                        **dsrl_kwargs,
+                    )
                 if self.critic_subsample_size > 0:
                     sample_idx = torch.randint(
                         0,
@@ -792,17 +987,47 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         critic_loss = squared_td_error.mean()
         critic_metrics = {}
         if collect_metrics:
-            critic_metrics = {
-                "q_data": all_data_q_values.mean().item(),
-                "q_mean": all_data_q_values.mean().item(),
-                "q_min": all_data_q_values.min().item(),
-                "q_max": all_data_q_values.max().item(),
-                "q_std": all_data_q_values.std(unbiased=False).item(),
-                "target_q_mean": target_q_values.mean().item(),
-                "target_q_min": target_q_values.min().item(),
-                "target_q_max": target_q_values.max().item(),
-                "target_q_std": target_q_values.std(unbiased=False).item(),
-            }
+            if bool(self.cfg.algorithm.get("reduce_metric_cuda_sync", False)):
+                q_stats = (
+                    torch.stack(
+                        (
+                            all_data_q_values.mean(),
+                            all_data_q_values.min(),
+                            all_data_q_values.max(),
+                            all_data_q_values.std(unbiased=False),
+                            target_q_values.mean(),
+                            target_q_values.min(),
+                            target_q_values.max(),
+                            target_q_values.std(unbiased=False),
+                        )
+                    )
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                critic_metrics = {
+                    "q_data": q_stats[0],
+                    "q_mean": q_stats[0],
+                    "q_min": q_stats[1],
+                    "q_max": q_stats[2],
+                    "q_std": q_stats[3],
+                    "target_q_mean": q_stats[4],
+                    "target_q_min": q_stats[5],
+                    "target_q_max": q_stats[6],
+                    "target_q_std": q_stats[7],
+                }
+            else:
+                critic_metrics = {
+                    "q_data": all_data_q_values.mean().item(),
+                    "q_mean": all_data_q_values.mean().item(),
+                    "q_min": all_data_q_values.min().item(),
+                    "q_max": all_data_q_values.max().item(),
+                    "q_std": all_data_q_values.std(unbiased=False).item(),
+                    "target_q_mean": target_q_values.mean().item(),
+                    "target_q_min": target_q_values.min().item(),
+                    "target_q_max": target_q_values.max().item(),
+                    "target_q_std": target_q_values.std(unbiased=False).item(),
+                }
         return critic_loss, critic_metrics
 
     @Worker.timer("forward_actor")
@@ -966,8 +1191,14 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             micro_batches[index] = batch
 
         metrics: dict[str, Any] = {}
+        use_cuda_timers = bool(self.cfg.actor.get("ogpo_cuda_timers", False))
+        actor_events = None
+        critic_events = None
         update_actor = train_actor and self.update_step % self.critic_actor_ratio == 0
         if update_actor:
+            if use_cuda_timers:
+                actor_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+                actor_events[0].record()
             if self._world_size > 1:
                 self.qf_optimizer.zero_grad(set_to_none=True)
             self.optimizer.zero_grad(set_to_none=True)
@@ -989,6 +1220,8 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
             self.optimizer.step()
             self.lr_scheduler.step()
             self._soft_update_ogpo_target(actor=True)
+            if actor_events is not None:
+                actor_events[1].record()
             if collect_metrics:
                 metrics.update(
                     {
@@ -1005,6 +1238,9 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                     }
                 )
 
+        if use_cuda_timers:
+            critic_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+            critic_events[0].record()
         self.optimizer.zero_grad(set_to_none=True)
         self.qf_optimizer.zero_grad(set_to_none=True)
         critic_losses = []
@@ -1023,6 +1259,21 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         self.qf_optimizer.step()
         self.qf_lr_scheduler.step()
         self._soft_update_ogpo_target(actor=False)
+        success_q_loss = None
+        if bool(self.cfg.algorithm.get("use_success_buffer_q", False)):
+            success_batch = self._online_success_q_batch(per_rank_batch_size)
+            if success_batch is not None:
+                self.qf_optimizer.zero_grad(set_to_none=True)
+                success_q_loss, _ = self.forward_critic(
+                    success_batch, collect_metrics=False
+                )
+                success_q_loss.backward()
+                self._clip_ogpo_grad_norm(
+                    actor=False, max_norm=self.cfg.actor.critic_optim.clip_grad
+                )
+                self.qf_optimizer.step()
+                self.qf_lr_scheduler.step()
+                self._soft_update_ogpo_target(actor=False)
         if collect_metrics:
             metrics.update(
                 {
@@ -1035,6 +1286,18 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
                     },
                 }
             )
+            if success_q_loss is not None:
+                metrics["critic/success_buffer_loss"] = float(success_q_loss.detach())
+        if critic_events is not None:
+            critic_events[1].record()
+            torch.cuda.synchronize(self.device)
+            metrics["profile/critic_ms_per_update"] = critic_events[0].elapsed_time(
+                critic_events[1]
+            )
+            if actor_events is not None:
+                metrics["profile/actor_training_ms_per_update"] = actor_events[
+                    0
+                ].elapsed_time(actor_events[1])
         return metrics
 
     def _run_online_training(self) -> dict[str, Any]:
@@ -1095,10 +1358,57 @@ class EmbodiedOGPOFSDPPolicy(EmbodiedSACFSDPPolicy):
         )
         self._online_env_steps += envs_per_step
         start_training = int(self.cfg.algorithm.get("start_training_env_steps", 10_000))
+        profile_enabled = bool(self.cfg.actor.get("ogpo_torch_profiler", False))
+        profile_start = int(
+            self.cfg.actor.get("ogpo_profiler_start_env_steps", start_training)
+        )
+        profile_limit = int(self.cfg.actor.get("ogpo_profiler_trace_count", 1))
+        should_profile = (
+            profile_enabled
+            and self._online_env_steps >= profile_start
+            and self._ogpo_profile_traces < profile_limit
+        )
+        profile_context = nullcontext()
+        if should_profile:
+            profile_context = torch.profiler.profile(
+                activities=[
+                    torch.profiler.ProfilerActivity.CPU,
+                    torch.profiler.ProfilerActivity.CUDA,
+                ],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=False,
+            )
+        training_events = None
+        if bool(self.cfg.actor.get("ogpo_cuda_timers", False)):
+            training_events = (torch.cuda.Event(True), torch.cuda.Event(True))
+            training_events[0].record()
         if self._online_env_steps < start_training:
             metrics = {}
         else:
-            metrics = self._run_online_training()
+            with profile_context as profiler:
+                metrics = self._run_online_training()
+            if should_profile:
+                profile_dir = Path(os.environ.get("OGPO_PROFILE_DIR", "ogpo_profiles"))
+                profile_dir.mkdir(parents=True, exist_ok=True)
+                trace_path = profile_dir / (
+                    f"actor_rank{self._rank}_env{self._online_env_steps}.json"
+                )
+                profiler.export_chrome_trace(str(trace_path))
+                self._ogpo_profile_traces += 1
+                self.log_info(f"Exported OGPO profiler trace to {trace_path}")
+        if training_events is not None:
+            training_events[1].record()
+            torch.cuda.synchronize(self.device)
+            metrics["profile/full_training_cuda_ms"] = training_events[0].elapsed_time(
+                training_events[1]
+            )
+            metrics["profile/gpu_memory_allocated_mb"] = (
+                torch.cuda.memory_allocated(self.device) / 1024**2
+            )
+            metrics["profile/gpu_memory_reserved_mb"] = (
+                torch.cuda.memory_reserved(self.device) / 1024**2
+            )
         metrics["ogpo/phase"] = 1.0
         metrics["ogpo/bc_update_steps"] = float(self._bc_update_steps)
         metrics["ogpo/online_env_steps"] = float(self._online_env_steps)

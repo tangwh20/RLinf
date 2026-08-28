@@ -22,6 +22,47 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 
+class TwoTierObservationEncoder(nn.Module):
+    """Match OGPO's image-feature/proprio fusion module.
+
+    The frozen image slice is L2-normalized before both modalities are
+    projected independently to half of ``fused_dim``. Actor and critic own
+    separate instances of this module, matching the Flax parameter tree.
+    """
+
+    def __init__(self, image_dim: int, proprio_dim: int, fused_dim: int):
+        super().__init__()
+        if fused_dim % 2:
+            raise ValueError(f"fused_dim must be even, got {fused_dim}")
+        if image_dim <= 0 or proprio_dim <= 0:
+            raise ValueError("image_dim and proprio_dim must both be positive")
+        self.image_dim = image_dim
+        self.proprio_dim = proprio_dim
+        half = fused_dim // 2
+        self.image_projection = nn.Linear(image_dim, half)
+        self.image_norm = nn.LayerNorm(half, eps=1e-6)
+        self.proprio_projection = nn.Linear(proprio_dim, half)
+        self.proprio_norm = nn.LayerNorm(half, eps=1e-6)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        expected = self.image_dim + self.proprio_dim
+        if observations.shape[-1] != expected:
+            raise ValueError(
+                f"two-tier encoder expected observation dim {expected}, "
+                f"got {observations.shape[-1]}"
+            )
+        image = observations[..., : self.image_dim]
+        proprio = observations[..., self.image_dim :]
+        image = image / (torch.linalg.vector_norm(image, dim=-1, keepdim=True) + 1e-6)
+        image = F.gelu(
+            self.image_norm(self.image_projection(image)), approximate="tanh"
+        )
+        proprio = F.gelu(
+            self.proprio_norm(self.proprio_projection(proprio)), approximate="tanh"
+        )
+        return torch.cat([image, proprio], dim=-1)
+
+
 class SinusoidalTimeEmbedding(nn.Module):
     """Official OGPO scalar-time embedding followed by a two-layer MLP."""
 
@@ -32,7 +73,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         self.embed_dim = embed_dim
         self.proj = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 2),
-            nn.GELU(),
+            nn.GELU(approximate="tanh"),
             nn.Linear(embed_dim * 2, embed_dim),
         )
 
@@ -67,6 +108,9 @@ class OGPOFlowMLPActor(nn.Module):
         error_correct_sde_to_ode: bool = False,
         randn_clip_value: float = 3.0,
         clip_intermediate_actions: bool = False,
+        two_tier_image_dim: int = 0,
+        two_tier_proprio_dim: int = 0,
+        two_tier_fused_dim: int = 0,
     ):
         super().__init__()
         self.obs_dim = obs_dim
@@ -85,13 +129,24 @@ class OGPOFlowMLPActor(nn.Module):
         else:
             self.register_buffer("action_scale", torch.ones(action_dim))
             self.register_buffer("action_bias", torch.zeros(action_dim))
+        self.two_tier = None
+        actor_obs_dim = obs_dim
+        if two_tier_image_dim > 0:
+            actor_obs_dim = two_tier_fused_dim or hidden_dims[0]
+            self.two_tier = TwoTierObservationEncoder(
+                two_tier_image_dim, two_tier_proprio_dim, actor_obs_dim
+            )
         self.official_time_embedding = SinusoidalTimeEmbedding(time_embedding_dim)
-        dims = [obs_dim + action_dim + time_embedding_dim, *hidden_dims, action_dim]
+        dims = [
+            actor_obs_dim + action_dim + time_embedding_dim,
+            *hidden_dims,
+            action_dim,
+        ]
         layers = []
         for index, (input_dim, output_dim) in enumerate(zip(dims[:-1], dims[1:])):
             layers.append(nn.Linear(input_dim, output_dim))
             if index < len(dims) - 2:
-                layers.append(nn.GELU())
+                layers.append(nn.GELU(approximate="tanh"))
         self.velocity_net = nn.Sequential(*layers)
         self._init_weights()
 
@@ -103,6 +158,8 @@ class OGPOFlowMLPActor(nn.Module):
 
     def predict_velocity(self, obs, actions, timesteps, train=False):
         del train
+        if self.two_tier is not None:
+            obs = self.two_tier(obs)
         time_features = self.official_time_embedding(timesteps)
         return self.velocity_net(torch.cat([obs, actions, time_features], dim=-1))
 
@@ -231,16 +288,21 @@ class OGPOMultiQHead(nn.Module):
         hidden_dims: tuple[int, ...] = (512, 512, 512, 512),
         num_q_heads: int = 10,
         vectorized_batch_limit: int = 1024,
+        two_tier_image_dim: int = 0,
+        two_tier_proprio_dim: int = 0,
+        two_tier_fused_dim: int = 0,
     ):
         super().__init__()
-        if len(hidden_dims) != 4:
-            raise ValueError(
-                "OGPOMultiQHead expects the official four hidden layers, got "
-                f"{len(hidden_dims)}"
-            )
         self.num_q_heads = num_q_heads
         self.vectorized_batch_limit = vectorized_batch_limit
-        dims = [obs_dim + action_dim, *hidden_dims, 1]
+        self.observation_encoder = None
+        critic_obs_dim = obs_dim
+        if two_tier_image_dim > 0:
+            critic_obs_dim = two_tier_fused_dim or hidden_dims[0]
+            self.observation_encoder = TwoTierObservationEncoder(
+                two_tier_image_dim, two_tier_proprio_dim, critic_obs_dim
+            )
+        dims = [critic_obs_dim + action_dim, *hidden_dims, 1]
         self.weights = nn.ParameterList()
         self.biases = nn.ParameterList()
         self.norm_weights = nn.ParameterList()
@@ -269,14 +331,14 @@ class OGPOMultiQHead(nn.Module):
                 normalized_shape = (activations.shape[-1],)
                 activations = torch.vmap(
                     lambda value, norm_weight, norm_bias: F.layer_norm(
-                        value, normalized_shape, norm_weight, norm_bias, 1e-5
+                        value, normalized_shape, norm_weight, norm_bias, 1e-6
                     )
                 )(
                     activations,
                     self.norm_weights[index],
                     self.norm_biases[index],
                 )
-                activations = F.gelu(activations)
+                activations = F.gelu(activations, approximate="tanh")
         return activations.squeeze(-1).transpose(0, 1)
 
     def _forward_head(self, inputs: torch.Tensor, head_index: int) -> torch.Tensor:
@@ -289,9 +351,9 @@ class OGPOMultiQHead(nn.Module):
                     (activations.shape[-1],),
                     self.norm_weights[index][head_index],
                     self.norm_biases[index][head_index],
-                    1e-5,
+                    1e-6,
                 )
-                activations = F.gelu(activations)
+                activations = F.gelu(activations, approximate="tanh")
         return activations
 
     def _forward_sequential(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -306,6 +368,8 @@ class OGPOMultiQHead(nn.Module):
     def forward(
         self, state_features: torch.Tensor, action_features: torch.Tensor
     ) -> torch.Tensor:
+        if self.observation_encoder is not None:
+            state_features = self.observation_encoder(state_features)
         inputs = torch.cat([state_features, action_features], dim=-1)
         if inputs.shape[0] <= self.vectorized_batch_limit:
             return self._forward_vectorized(inputs)
